@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="theme-color" content="#252923" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main id="article" class="page">
+      <section class="upload-panel">
+      <div
+        id="dropzone"
+        class="dropzone"
+        tabindex="0"
+        role="button"
+      >
+        <input id="fileInput" type="file" accept=".Civ5Save" hidden />
+        <strong id="dropTitle">Drop a .Civ5Save file or click to choose</strong>
+        <span id="dropHint"></span>
+      </div>
+      <div id="status" class="status" role="status" aria-live="polite"></div>
+      </section>
+
+      <section id="result" class="result" hidden>
+        <header class="result-head">
+          <h1 id="saveTitle">Save</h1>
+          <span id="savePath" class="filename"></span>
+        </header>
+        <div class="metrics" id="details">
+          <div class="metric"><span>TURN</span><b id="turn">—</b></div>
+          <div class="metric">
+            <span>MAP SIZE</span><b id="dimensions">—</b>
+          </div>
+          <div class="metric"><span>PLAY TIME</span><b id="playtime">—</b></div>
+          <div class="metric"><span>DATA</span><b id="payloadSize">—</b></div>
+        </div>
+        <div class="content-grid">
+          <section class="card">
+            <h2>Players</h2>
+            <div id="playerOverview" class="roster-wrap"></div>
+          </section>
+          <section class="card">
+            <h2>Game setup</h2>
+            <div id="facts" class="facts"></div>
+          </section>
+        </div>
+        <nav class="tabs">
+          <button class="active" data-tab="summary">Summary</button>
+          <button data-tab="strings">Strings</button>
+          <button data-tab="players">Player slots</button>
+        </nav>
+        <section class="card"><div id="tabContent" class="raw"></div></section>
+      </section>
+    </main>
+    <script src="./app.js"></script>
+  </body>
+</html>
