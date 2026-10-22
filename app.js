@@ -2,6 +2,18 @@
 const playerColors = window.CIV5_PLAYER_COLORS || {};
 const civilizationColors = window.CIV5_REPLAY_CIV_COLORS || {};
 const replayCivAssets = window.CIV5_REPLAY_CIV_ASSETS || [];
+const normalizeReplayName = (value) =>
+  String(value || "")
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]/gu, "");
+const cityStateTraits = Object.fromEntries(
+  Object.entries(window.CIV5_CITY_STATE_TRAITS || {}).map(([name, trait]) => [
+    normalizeReplayName(name),
+    trait,
+  ]),
+);
 const $ = (s) => document.querySelector(s);
 const drop = $("#dropzone"),
   input = $("#fileInput");
@@ -1210,6 +1222,7 @@ function renderReplayTab(tab, d, box) {
     }
     let territoryOpacity = Number(opacityRange.value),
       currentOwners = new Map(),
+      currentCities = new Map(),
       zoom = 1,
       zoomTarget = 1,
       zoomAnimation = null,
@@ -1435,23 +1448,40 @@ function renderReplayTab(tab, d, box) {
       });
     };
     const terrainImages = loadReplayTerrainImages();
+    const cityIcons = loadReplayCityIcons();
     drawStaticLayers();
     terrainImages.ready.then(() => {
       if (box.contains(world)) drawStaticLayers();
     });
+    viewport.addEventListener("dragstart", (event) => event.preventDefault());
     const drawTerritory = () => {
       const ctx = layers.territory.ctx;
       ctx.clearRect(0, 0, canvasWidth, canvasHeight);
       const owners = new Map(),
+        cities = new Map(),
         turn = Number(range.value);
       for (const e of r.events) {
         if (e.turn > turn) break;
-        if (e.type === "CITY_FOUNDED" && e.x !== undefined)
+        if (e.type === "CITY_FOUNDED" && e.x !== undefined) {
           owners.set(`${e.x},${e.y}`, e.civ || "");
-        else if (e.type === "TILES_CLAIMED" || e.type === "CITIES_TRANSFERRED")
+          cities.set(`${e.x},${e.y}`, {
+            owner: e.civ || "",
+            eventText: e.text || "",
+          });
+        } else if (e.type === "CITY_RAZED") {
+          for (const tile of e.tiles) cities.delete(`${tile.x},${tile.y}`);
+        } else if (e.type === "CITIES_TRANSFERRED") {
+          for (const tile of e.tiles) {
+            owners.set(`${tile.x},${tile.y}`, e.civ || "");
+            const city = cities.get(`${tile.x},${tile.y}`);
+            if (city) city.owner = e.civ || "";
+          }
+        } else if (e.type === "TILES_CLAIMED") {
           for (const t of e.tiles) owners.set(`${t.x},${t.y}`, e.civ || "");
+        }
       }
       currentOwners = owners;
+      currentCities = cities;
       r.tiles.forEach((tile, i) => {
         const x = i % r.mapWidth,
           y = Math.floor(i / r.mapWidth),
@@ -1463,12 +1493,50 @@ function renderReplayTab(tab, d, box) {
         const cx = radius + hexW * (x + 0.5 * (y & 1)),
           cy = radius + radius * 1.5 * y;
         traceReplayHex(ctx, cx, cy, radius);
-        ctx.fillStyle = player.secondaryColor || player.color;
+        const city = cities.get(`${x},${y}`),
+          isMajorCity =
+            city &&
+            player.civilization !== "CIVILIZATION_MINOR" &&
+            player.civilization !== "CIVILIZATION_BARBARIAN" &&
+            !(player.civilization || "").startsWith("MINOR_CIV_");
+        ctx.fillStyle = isMajorCity
+          ? player.color
+          : player.secondaryColor || player.color;
         ctx.fill();
         ctx.strokeStyle = player.color;
         ctx.lineWidth = 1.5;
         ctx.stroke();
       });
+      for (const [key, city] of cities) {
+        const [x, y] = key.split(",").map(Number),
+          cx = radius + hexW * (x + 0.5 * (y & 1)),
+          cy = radius + radius * 1.5 * y,
+          player = h.players.find(
+            (p) => p.shortName === city.owner || p.name === city.owner,
+          );
+        if (
+          player?.civilization === "CIVILIZATION_MINOR" ||
+          (player?.civilization || "").startsWith("MINOR_CIV_")
+        ) {
+          const trait = cityStateTraits[normalizeReplayName(city.owner)],
+            traitImage = trait ? cityIcons[trait] : null;
+          if (cityIcons.CIV_CS_ICON)
+            ctx.drawImage(cityIcons.CIV_CS_ICON, cx - 7, cy - 7, 10, 10);
+          if (traitImage)
+            ctx.drawImage(traitImage, cx + 1, cy - 4, 7, 7);
+        } else {
+          ctx.beginPath();
+          ctx.arc(cx, cy, 5.5, 0, Math.PI * 2);
+          ctx.fillStyle = player?.color || "#f4ead0";
+          ctx.fill();
+          ctx.lineWidth = 1.5;
+          ctx.strokeStyle = "#fffdf8";
+          ctx.stroke();
+          ctx.fillStyle = "#282820";
+          ctx.fillRect(cx - 2, cy - 1.5, 4, 4);
+          ctx.fillRect(cx - 3.5, cy + 1, 7, 1.5);
+        }
+      }
       box.querySelector("#mapTurnLabel").textContent = turn;
     };
     viewport.addEventListener("mousemove", (event) => {
@@ -1491,6 +1559,7 @@ function renderReplayTab(tab, d, box) {
       const x = tileIndex % r.mapWidth,
         y = Math.floor(tileIndex / r.mapWidth),
         owner = currentOwners.get(`${x},${y}`),
+        city = currentCities.get(`${x},${y}`),
         player = h.players.find(
           (p) => p.shortName === owner || p.name === owner,
         ),
@@ -1500,6 +1569,7 @@ function renderReplayTab(tab, d, box) {
           replayElevationLabel(tile.elevationId),
           replayFeatureLabel(tile.featureId),
           player ? player.displayCiv || player.shortName : owner || "Unclaimed",
+          city?.eventText || "",
         ],
         viewportRect = viewport.getBoundingClientRect();
       tooltip.textContent = details.filter(Boolean).join(" · ");
@@ -1529,6 +1599,9 @@ function renderReplayTab(tab, d, box) {
       drawTerritory();
     });
     drawTerritory();
+    cityIcons.ready.then(() => {
+      if (box.contains(world)) drawTerritory();
+    });
     return;
   }
 }
@@ -1591,6 +1664,32 @@ function loadReplayTerrainImages() {
           };
           image.onerror = resolve;
           image.src = `assets/terrain/${name}.png`;
+        }),
+    ),
+  );
+  return images;
+}
+function loadReplayCityIcons() {
+  const images = {};
+  const names = [
+    "CIV_CS_ICON",
+    "Cultured",
+    "Maritime",
+    "Mercantile",
+    "Militaristic",
+    "Religious",
+  ];
+  images.ready = Promise.all(
+    names.map(
+      (name) =>
+        new Promise((resolve) => {
+          const image = new Image();
+          image.onload = () => {
+            images[name === "CIV_CS_ICON" ? name : name.toUpperCase()] = image;
+            resolve();
+          };
+          image.onerror = resolve;
+          image.src = `assets/civ5-icons/${name}.png`;
         }),
     ),
   );
