@@ -17,8 +17,8 @@
         tabindex="0"
         role="button"
       >
-        <input id="fileInput" type="file" accept=".Civ5Save" hidden />
-        <strong id="dropTitle">Drop a .Civ5Save file or click to choose</strong>
+        <input id="fileInput" type="file" accept=".Civ5Save,.Civ5Replay" hidden />
+        <strong id="dropTitle">Drop a .Civ5Save or .Civ5Replay</strong>
         <span id="dropHint"></span>
       </div>
       <div id="status" class="status" role="status" aria-live="polite"></div>
@@ -45,16 +45,24 @@
           <section class="card">
             <h2>Game setup</h2>
             <div id="facts" class="facts"></div>
+            <div id="lobbyOptions" class="lobby-options" hidden></div>
+            <div id="dlcRecords" class="slot-groups dlc-records" hidden></div>
           </section>
         </div>
         <nav class="tabs">
           <button class="active" data-tab="summary">Summary</button>
+          <button data-tab="history">Turn history</button>
+          <button data-tab="events">Events</button>
+          <button data-tab="map">Map history</button>
+          <button data-tab="units">Units</button>
+          <button data-tab="players">Players</button>
+          <button data-tab="metadata">Metadata</button>
           <button data-tab="strings">Strings</button>
-          <button data-tab="players">Player slots</button>
         </nav>
         <section class="card"><div id="tabContent" class="raw"></div></section>
       </section>
     </main>
+    <script src="./assets/civ5-colors.js"></script>
     <script src="./app.js"></script>
   </body>
 </html>
