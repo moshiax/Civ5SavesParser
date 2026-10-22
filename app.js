@@ -561,18 +561,18 @@ function parseReplay(bytes, filename) {
       const junk1 = i32(),
         junk2 = i32();
       return {
-        junk1,
-        junk2,
-        elevationId: i8(),
+        stateCount: junk1,
+        stateTurn: junk2,
+        plotTypeId: i8(),
         typeId: i8(),
         featureId: i8(),
-        junk3: i8(),
+        riverMask: i8(),
       };
     },
     mapWidth * mapHeight,
   );
   const typeNames = [
-    "MESSAGE",
+    "MAJOR_EVENT",
     "CITY_FOUNDED",
     "TILES_CLAIMED",
     "CITIES_TRANSFERRED",
@@ -1158,6 +1158,7 @@ function renderReplayTab(tab, d, box) {
       h.startTurn,
       Math.min(1, Math.max(h.startTurn, h.endTurn)),
     );
+    const canvasY = (row) => canvasHeight - radius - radius * 1.5 * row;
     const mapCard = box.closest(".card");
     mapCard.style.width = `min(${canvasWidth + 36}px,calc(100vw - 24px))`;
     mapCard.style.boxSizing = "border-box";
@@ -1213,6 +1214,18 @@ function renderReplayTab(tab, d, box) {
         ),
       ),
     );
+    const riverCanvas = document.createElement("canvas");
+    riverCanvas.className = "map-layer-canvas";
+    riverCanvas.dataset.mapLayer = "rivers";
+    world.insertBefore(riverCanvas, layers.territory.canvas);
+    const riverCtx = riverCanvas.getContext("2d");
+    layers.rivers = { canvas: riverCanvas, ctx: riverCtx };
+    const layerControls = box.querySelector(".map-layer-controls");
+    if (layerControls) {
+      const riverLabel = document.createElement("label");
+      riverLabel.innerHTML = '<input type="checkbox" data-map-layer="rivers" checked>Rivers';
+      layerControls.append(riverLabel);
+    }
     for (const { canvas, ctx } of Object.values(layers)) {
       canvas.width = Math.max(1, Math.round(canvasWidth * renderScale));
       canvas.height = Math.max(1, Math.round(canvasHeight * renderScale));
@@ -1408,13 +1421,17 @@ function renderReplayTab(tab, d, box) {
     viewport.addEventListener("pointercancel", endPan);
     viewport.addEventListener("lostpointercapture", endPan);
     const drawStaticLayers = () => {
-      for (const layer of ["terrain", "elevation", "features", "grid"])
+      for (const layer of ["terrain", "elevation", "features", "grid", "rivers"])
         layers[layer].ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+      const riverPattern = terrainImages.COAST?.complete && terrainImages.COAST.naturalWidth
+        ? layers.rivers.ctx.createPattern(terrainImages.COAST, "repeat")
+        : null;
+      riverPattern?.setTransform?.(new DOMMatrix().scale(0.22));
       r.tiles.forEach((tile, i) => {
         const x = i % r.mapWidth,
           y = Math.floor(i / r.mapWidth),
           cx = radius + hexW * (x + 0.5 * (y & 1)),
-          cy = radius + radius * 1.5 * y,
+          cy = canvasY(y),
           left = cx - hexW / 2,
           top = cy - radius;
         traceReplayHex(layers.terrain.ctx, cx, cy, radius);
@@ -1429,7 +1446,7 @@ function renderReplayTab(tab, d, box) {
         }
         layers.terrain.ctx.restore();
         for (const [layer, name] of [
-          ["elevation", replayElevationName(tile.elevationId)],
+          ["elevation", replayElevationName(tile.plotTypeId)],
           ["features", replayFeatureName(tile.featureId)],
         ]) {
           const image = terrainImages[name];
@@ -1441,6 +1458,14 @@ function renderReplayTab(tab, d, box) {
           ctx.drawImage(image, left, top, hexW, radius * 2);
           ctx.restore();
         }
+        drawReplayRiver(
+          layers.rivers.ctx,
+          cx,
+          cy,
+          radius,
+          tile.riverMask,
+          riverPattern,
+        );
         traceReplayHex(layers.grid.ctx, cx, cy, radius);
         layers.grid.ctx.strokeStyle = "rgba(20,24,22,.16)";
         layers.grid.ctx.lineWidth = 0.5;
@@ -1491,26 +1516,82 @@ function renderReplayTab(tab, d, box) {
           );
         if (!player) return;
         const cx = radius + hexW * (x + 0.5 * (y & 1)),
-          cy = radius + radius * 1.5 * y;
+          cy = canvasY(y);
         traceReplayHex(ctx, cx, cy, radius);
         const city = cities.get(`${x},${y}`),
+          isCityState =
+            player.civilization === "CIVILIZATION_MINOR" ||
+            (player.civilization || "").startsWith("MINOR_CIV_"),
           isMajorCity =
             city &&
-            player.civilization !== "CIVILIZATION_MINOR" &&
-            player.civilization !== "CIVILIZATION_BARBARIAN" &&
-            !(player.civilization || "").startsWith("MINOR_CIV_");
-        ctx.fillStyle = isMajorCity
-          ? player.color
-          : player.secondaryColor || player.color;
+            !isCityState &&
+            player.civilization !== "CIVILIZATION_BARBARIAN";
+        const cityColor = player.secondaryColor || player.color;
+        ctx.fillStyle = isCityState
+          ? city
+            ? cityColor
+            : "#000"
+          : isMajorCity
+            ? player.color
+            : cityColor;
         ctx.fill();
-        ctx.strokeStyle = player.color;
+      });
+      r.tiles.forEach((tile, i) => {
+        const x = i % r.mapWidth,
+          y = Math.floor(i / r.mapWidth),
+          owner = owners.get(`${x},${y}`);
+        if (!owner) return;
+        const player = h.players.find(
+            (p) => p.shortName === owner || p.name === owner,
+          );
+        if (!player) return;
+        const isCityState =
+            player.civilization === "CIVILIZATION_MINOR" ||
+            (player.civilization || "").startsWith("MINOR_CIV_"),
+          borderColor = isCityState
+            ? player.secondaryColor || player.color
+            : player.color,
+          cx = radius + hexW * (x + 0.5 * (y & 1)),
+          cy = canvasY(y),
+          neighbors = y & 1
+            ? [
+                [x + 1, y, 0],
+                [x + 1, y + 1, 5],
+                [x, y + 1, 4],
+                [x - 1, y, 3],
+                [x, y - 1, 2],
+                [x + 1, y - 1, 1],
+              ]
+            : [
+                [x + 1, y, 0],
+                [x, y + 1, 5],
+                [x - 1, y + 1, 4],
+                [x - 1, y, 3],
+                [x - 1, y - 1, 2],
+                [x, y - 1, 1],
+              ];
+        ctx.strokeStyle = borderColor;
         ctx.lineWidth = 1.5;
-        ctx.stroke();
+        for (const [neighborX, neighborY, side] of neighbors) {
+          const neighborOwner = owners.get(`${neighborX},${neighborY}`);
+          if (neighborOwner === owner) continue;
+          if (neighborOwner) {
+            ctx.save();
+            traceReplayHex(ctx, cx, cy, radius);
+            ctx.clip();
+            traceReplayHexEdge(ctx, cx, cy, radius, side);
+            ctx.stroke();
+            ctx.restore();
+          } else {
+            traceReplayHexEdge(ctx, cx, cy, radius, side);
+            ctx.stroke();
+          }
+        }
       });
       for (const [key, city] of cities) {
         const [x, y] = key.split(",").map(Number),
           cx = radius + hexW * (x + 0.5 * (y & 1)),
-          cy = radius + radius * 1.5 * y,
+          cy = canvasY(y),
           player = h.players.find(
             (p) => p.shortName === city.owner || p.name === city.owner,
           );
@@ -1525,16 +1606,32 @@ function renderReplayTab(tab, d, box) {
           if (traitImage)
             ctx.drawImage(traitImage, cx + 1, cy - 4, 7, 7);
         } else {
-          ctx.beginPath();
-          ctx.arc(cx, cy, 5.5, 0, Math.PI * 2);
-          ctx.fillStyle = player?.color || "#f4ead0";
-          ctx.fill();
-          ctx.lineWidth = 1.5;
-          ctx.strokeStyle = "#fffdf8";
-          ctx.stroke();
-          ctx.fillStyle = "#282820";
-          ctx.fillRect(cx - 2, cy - 1.5, 4, 4);
-          ctx.fillRect(cx - 3.5, cy + 1, 7, 1.5);
+          if (cityIcons.CIV_CITY_ICON) {
+            const iconSize = Math.min(hexW, radius * 2);
+            traceReplayHex(ctx, cx, cy, radius);
+            ctx.save();
+            ctx.clip();
+            ctx.globalAlpha = 0.7;
+            ctx.drawImage(
+              cityIcons.CIV_CITY_ICON,
+              cx - iconSize / 2,
+              cy - iconSize / 2,
+              iconSize,
+              iconSize,
+            );
+            ctx.restore();
+          } else {
+            ctx.beginPath();
+            ctx.arc(cx, cy, 5.5, 0, Math.PI * 2);
+            ctx.fillStyle = player?.color || "#f4ead0";
+            ctx.fill();
+            ctx.lineWidth = 1.5;
+            ctx.strokeStyle = "#fffdf8";
+            ctx.stroke();
+            ctx.fillStyle = "#282820";
+            ctx.fillRect(cx - 2, cy - 1.5, 4, 4);
+            ctx.fillRect(cx - 3.5, cy + 1, 7, 1.5);
+          }
         }
       }
       box.querySelector("#mapTurnLabel").textContent = turn;
@@ -1542,7 +1639,7 @@ function renderReplayTab(tab, d, box) {
     viewport.addEventListener("mousemove", (event) => {
       const rect = world.getBoundingClientRect(),
         px = ((event.clientX - rect.left) * canvasWidth) / rect.width,
-        py = ((event.clientY - rect.top) * canvasHeight) / rect.height,
+        py = canvasHeight - ((event.clientY - rect.top) * canvasHeight) / rect.height,
         tileIndex = locateReplayTile(
           px,
           py,
@@ -1566,8 +1663,9 @@ function renderReplayTab(tab, d, box) {
         details = [
           `Tile ${x + 1}, ${y + 1}`,
           replayTerrainLabel(tile.typeId),
-          replayElevationLabel(tile.elevationId),
+          replayElevationLabel(tile.plotTypeId),
           replayFeatureLabel(tile.featureId),
+          replayRiverLabel(tile.riverMask),
           player ? player.displayCiv || player.shortName : owner || "Unclaimed",
           city?.eventText || "",
         ],
@@ -1637,6 +1735,45 @@ function traceReplayHex(ctx, cx, cy, radius) {
   }
   ctx.closePath();
 }
+function traceReplayHexEdge(ctx, cx, cy, radius, side) {
+  const angle = (Math.PI / 180) * (60 * side - 30),
+    nextAngle = (Math.PI / 180) * (60 * (side + 1) - 30);
+  ctx.beginPath();
+  ctx.moveTo(cx + radius * Math.cos(angle), cy + radius * Math.sin(angle));
+  ctx.lineTo(
+    cx + radius * Math.cos(nextAngle),
+    cy + radius * Math.sin(nextAngle),
+  );
+}
+function drawReplayRiver(ctx, cx, cy, radius, mask, texture) {
+  if (!ctx || !(mask & 0x0e)) return;
+  const vertices = Array.from({ length: 6 }, (_, side) => {
+    const angle = (Math.PI / 180) * (60 * side - 30);
+    return [cx + radius * Math.cos(angle), cy + radius * Math.sin(angle)];
+  });
+  const edges = [];
+  if (mask & 0x04) edges.push([vertices[0], vertices[1]]); // WOfRiver: east edge
+  if (mask & 0x02) edges.push([vertices[1], vertices[2]]); // NWOfRiver: southeast edge
+  if (mask & 0x08) edges.push([vertices[2], vertices[3]]); // NEOfRiver: southwest edge
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  for (const [start, end] of edges) {
+    ctx.beginPath();
+    ctx.moveTo(...start);
+    ctx.lineTo(...end);
+    ctx.strokeStyle = "rgba(29,62,62,.62)";
+    ctx.lineWidth = 4.2;
+    ctx.stroke();
+    ctx.strokeStyle = texture || "#5a918d";
+    ctx.lineWidth = 2.8;
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(190,220,205,.62)";
+    ctx.lineWidth = 0.75;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
 function loadReplayTerrainImages() {
   const images = {};
   const names = [
@@ -1672,6 +1809,7 @@ function loadReplayTerrainImages() {
 function loadReplayCityIcons() {
   const images = {};
   const names = [
+    "CIV_CITY_ICON",
     "CIV_CS_ICON",
     "Cultured",
     "Maritime",
@@ -1725,6 +1863,14 @@ function replayTerrainName(id) {
 }
 function replayElevationName(id) {
   return ["MOUNTAIN", "HILLS"][id];
+}
+function replayRiverLabel(mask) {
+  const edges = [
+    (mask & 0x02) && "NW",
+    (mask & 0x04) && "W",
+    (mask & 0x08) && "NE",
+  ].filter(Boolean);
+  return edges.map((edge) => `River ${edge}`).join(", ");
 }
 function replayFeatureName(id) {
   return { 0: "ICE", 1: "JUNGLE", 5: "FOREST" }[id];
