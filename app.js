@@ -1094,7 +1094,14 @@ function renderReplayTab(tab, d, box) {
       ]),
     ));
   if (tab === "events") {
-    box.innerHTML = replayTable(
+    const isCityState = (player) =>
+      player?.civilization === "CIVILIZATION_MINOR" ||
+      (player?.civilization || "").startsWith("MINOR_CIV_");
+    const metrics = r.metrics.map((m) => ({
+      key: m.key,
+      byPlayer: m.byPlayer.map((samples) => samples.filter((point) => point.value !== 0)),
+    })).filter((m) => m.byPlayer.some((samples, player) => samples.length && !isCityState(h.players[player])));
+    box.innerHTML = `${metrics.length ? `<section class="event-chart-card"><div class="event-chart-head"><h3>Game metrics</h3><label class="metric-picker">Metric <select id="eventMetricSelect">${metrics.map((m, i) => `<option value="${i}">${esc(m.key)}</option>`).join("")}</select></label></div><div id="eventChart" class="event-chart"></div></section>` : ""}<h3 class="events-heading">Timeline</h3>${replayTable(
       ["Turn", "Year", "Type", "Civilization", "Location", "Event"],
       r.events
         .map((e) => [
@@ -1106,7 +1113,34 @@ function renderReplayTab(tab, d, box) {
           { trustedHtml: true, value: renderEventText(e.text) },
         ])
         .sort((a, b) => a[0] - b[0]),
-    );
+    )}`;
+    const eventMetricSelect = box.querySelector("#eventMetricSelect"),
+      eventChart = box.querySelector("#eventChart");
+    if (eventMetricSelect && eventChart) {
+      const drawEventChart = () => {
+        const metric = metrics[Number(eventMetricSelect.value)],
+          width = 900, height = 290, pad = { left: 54, right: 22, top: 20, bottom: 38 },
+          points = metric.byPlayer.flatMap((samples, player) => isCityState(h.players[player]) ? [] : samples),
+          minTurn = h.startTurn, maxTurn = Math.max(minTurn + 1, h.endTurn),
+          minValue = Math.min(0, ...points.map((point) => point.value)),
+          maxValue = Math.max(1, ...points.map((point) => point.value)),
+          x = (turn) => pad.left + (turn - minTurn) / (maxTurn - minTurn) * (width - pad.left - pad.right),
+          y = (value) => height - pad.bottom - (value - minValue) / (maxValue - minValue || 1) * (height - pad.top - pad.bottom),
+          colors = h.players.map((player) => player.color || "#88754e"),
+          lines = metric.byPlayer.map((samples, player) => {
+            if (!samples.length || isCityState(h.players[player])) return "";
+            const sorted = [...samples].sort((a, b) => a.turn - b.turn);
+            return `<path d="${sorted.map((point, i) => `${i ? "L" : "M"}${x(point.turn).toFixed(1)},${y(point.value).toFixed(1)}`).join(" ")}" fill="none" stroke="${colors[player]}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"><title>${esc(h.players[player]?.displayCiv || h.players[player]?.shortName || `Player ${player + 1}`)}</title></path>`;
+          }).join(""),
+          ticks = [0, .25, .5, .75, 1].map((t) => {
+            const value = minValue + (maxValue - minValue) * t, yy = y(value);
+            return `<line x1="${pad.left}" x2="${width - pad.right}" y1="${yy}" y2="${yy}" class="chart-gridline"/><text x="${pad.left - 9}" y="${yy + 4}" text-anchor="end" class="chart-axis-label">${Math.round(value).toLocaleString()}</text>`;
+          }).join("");
+        eventChart.innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(metric.key)} by turn">${ticks}<line x1="${pad.left}" x2="${width - pad.right}" y1="${height - pad.bottom}" y2="${height - pad.bottom}" class="chart-axis"/><text x="${pad.left}" y="${height - 10}" class="chart-axis-label">Turn ${minTurn}</text><text x="${width - pad.right}" y="${height - 10}" text-anchor="end" class="chart-axis-label">Turn ${h.endTurn}</text>${lines}</svg><div class="event-chart-legend">${metric.byPlayer.map((samples, player) => samples.length && !isCityState(h.players[player]) ? `<span><i style="--series-color:${colors[player]}"></i>${esc(h.players[player]?.displayCiv || h.players[player]?.shortName || `Player ${player + 1}`)}</span>` : "").join("")}</div>`;
+      };
+      eventMetricSelect.addEventListener("change", drawEventChart);
+      drawEventChart();
+    }
     box
       .querySelectorAll(".game-icon")
       .forEach((icon) =>
@@ -1150,7 +1184,10 @@ function renderReplayTab(tab, d, box) {
     return;
   }
   if (tab === "map") {
-    const radius = 9,
+    const mapCard = box.closest(".card"),
+      contentGridWidth = document.querySelector(".content-grid")?.getBoundingClientRect().width || mapCard.clientWidth,
+      mapInnerMinWidth = Math.max(1, contentGridWidth - 36),
+      radius = Math.max(9, mapInnerMinWidth / (2 + Math.sqrt(3) * r.mapWidth)),
       hexW = Math.sqrt(3) * radius,
       canvasWidth = Math.ceil(radius * 2 + hexW * r.mapWidth),
       canvasHeight = Math.ceil(radius * 2 + radius * 1.5 * (r.mapHeight - 1));
@@ -1159,8 +1196,7 @@ function renderReplayTab(tab, d, box) {
       Math.min(1, Math.max(h.startTurn, h.endTurn)),
     );
     const canvasY = (row) => canvasHeight - radius - radius * 1.5 * row;
-    const mapCard = box.closest(".card");
-    mapCard.style.width = `min(${canvasWidth + 36}px,calc(100vw - 24px))`;
+    mapCard.style.width = `min(${Math.max(contentGridWidth, canvasWidth + 36)}px,calc(100vw - 24px))`;
     mapCard.style.boxSizing = "border-box";
     const terrainLegend = [
       ["GRASSLAND", "Grassland"],
