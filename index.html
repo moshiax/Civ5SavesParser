@@ -9,6 +9,11 @@
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
+    <button id="themeToggle" class="theme-toggle" type="button" title="Switch theme">
+      <svg class="theme-icon theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.3 15.4A8.5 8.5 0 0 1 8.6 3.7 8.6 8.6 0 1 0 20.3 15.4Z" /></svg>
+      <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42" /></svg>
+    </button>
+    <div id="notification" class="notification"><p></p></div>
     <main id="article" class="page">
       <section class="upload-panel">
         <div id="dropzone" class="dropzone" tabindex="0" role="button">
@@ -64,6 +69,7 @@
     </main>
     <script src="./assets/civ5-colors.js"></script>
     <script src="./assets/city-state-data.js"></script>
+    <script src="./webm-muxer.js"></script>
     <script src="./app.js"></script>
   </body>
 </html>

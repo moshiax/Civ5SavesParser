@@ -1,4 +1,14 @@
 "use strict";
+function showNotification(message) {
+  const notification = document.getElementById("notification");
+  notification.querySelector("p").innerText = message;
+  notification.style.display = "block";
+  notification.style.animation = "fadeIn 0.5s";
+  setTimeout(() => {
+    notification.style.animation = "fadeOut 0.5s";
+    setTimeout(() => { notification.style.display = "none"; }, 500);
+  }, 2300);
+}
 const playerColors = window.CIV5_PLAYER_COLORS || {};
 const civilizationColors = window.CIV5_REPLAY_CIV_COLORS || {};
 const replayCivAssets = window.CIV5_REPLAY_CIV_ASSETS || [];
@@ -15,11 +25,77 @@ const cityStateTraits = Object.fromEntries(
   ]),
 );
 const $ = (s) => document.querySelector(s);
+const cssColor = (name) =>
+  getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const replayPalette = {
+  player: cssColor("--color-player-default"),
+  playerSecondary: cssColor("--color-player-secondary-default"),
+  playerSecondaryNeutral: cssColor("--color-player-secondary-neutral"),
+  replayFallback: cssColor("--color-replay-fallback"),
+  unclaimedMinor: cssColor("--map-citystate-unclaimed"),
+  cityMarker: cssColor("--map-city-marker"),
+  cityMarkerStroke: cssColor("--map-city-marker-stroke"),
+  cityMarkerDetail: cssColor("--map-city-marker-detail"),
+  riverShadow: cssColor("--map-river-shadow"),
+  riverWater: cssColor("--map-river-water"),
+  riverHighlight: cssColor("--map-river-highlight"),
+  mapGrid: cssColor("--map-grid-line"),
+  terrain: [
+    "--terrain-color-0", "--terrain-color-1", "--terrain-color-2",
+    "--terrain-color-3", "--terrain-color-4", "--terrain-color-5",
+    "--terrain-color-6",
+  ].map(cssColor),
+  terrainFallback: cssColor("--terrain-color-fallback"),
+};
 const drop = $("#dropzone"),
   input = $("#fileInput");
 let current = null,
   activeTab = "summary";
+let replayTabCacheOwner = null;
+const replayTabCache = new Map();
 let dragDepth = 0;
+const themeToggle = $("#themeToggle"),
+  themePreference = window.matchMedia?.("(prefers-color-scheme: dark)");
+const readThemeChoice = () => {
+  try {
+    return localStorage.getItem("civ5-parser-theme");
+  } catch {
+    return null;
+  }
+};
+const applyTheme = (theme) => {
+  document.documentElement.dataset.theme = theme;
+  replayPalette.mapGrid = cssColor("--map-grid-line");
+  themeToggle?.setAttribute(
+    "title",
+    theme === "dark" ? "Switch to light theme" : "Switch to dark theme",
+  );
+  document.querySelector('meta[name="theme-color"]')?.setAttribute(
+    "content",
+    cssColor("--theme-color"),
+  );
+};
+const savedTheme = readThemeChoice();
+applyTheme(
+  savedTheme === "dark" || savedTheme === "light"
+    ? savedTheme
+    : themePreference?.matches
+      ? "dark"
+      : "light",
+);
+themeToggle?.addEventListener("click", () => {
+  const nextTheme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  applyTheme(nextTheme);
+  try {
+    localStorage.setItem("civ5-parser-theme", nextTheme);
+  } catch {
+  }
+});
+themePreference?.addEventListener("change", (event) => {
+  const choice = readThemeChoice();
+  if (choice !== "dark" && choice !== "light")
+    applyTheme(event.matches ? "dark" : "light");
+});
 function esc(s) {
   return String(s ?? "").replace(
     /[&<>"']/g,
@@ -515,8 +591,8 @@ function parseReplay(bytes, filename) {
       name: c.longName,
       shortName: c.name,
       demonym: c.demonym,
-      color: color.color || color[0] || "#777777",
-      secondaryColor: color.secondaryColor || color[1] || "#eeeeee",
+      color: color.color || color[0] || replayPalette.player,
+      secondaryColor: color.secondaryColor || color[1] || replayPalette.playerSecondary,
       iconKey: asset?.icon || "",
       iconAvailable: Boolean(asset),
       raw: c.raw,
@@ -900,8 +976,8 @@ function drawPlayers(players, cityStates = null) {
       const badgeStyle = `--civ-hue:${hue};--civ-color:${badgeColor};--civ-secondary:${badgeSecondary}`;
       const mark =
         p.iconAvailable === false || civ.startsWith("MINOR_CIV_")
-          ? `<span class="civ-mark civ-mark-fallback" style="${badgeStyle}" aria-label="${esc(label)}">${esc(short)}</span>`
-          : `<img class="civ-mark civ-mark-image" style="${badgeStyle}" src="./assets/civ-icons/${esc(civKey)}.png" alt="${esc(label)} emblem" title="${esc(label)}"><span hidden class="civ-mark civ-mark-fallback" style="${badgeStyle}" aria-label="${esc(label)}">${esc(short)}</span>`;
+          ? `<span class="civ-mark civ-mark-fallback" style="${badgeStyle}">${esc(short)}</span>`
+          : `<img class="civ-mark civ-mark-image" style="${badgeStyle}" src="./assets/civ-icons/${esc(civKey)}.png" alt="${esc(label)} emblem" title="${esc(label)}"><span hidden class="civ-mark civ-mark-fallback" style="${badgeStyle}">${esc(short)}</span>`;
       const subtitle = isReplay
         ? p.leader || civ || label
         : civ || p.displayCiv || label;
@@ -926,19 +1002,25 @@ function civBadgeColors(player) {
   const [civColor, civSecondary] =
     civilizationColors[player.civilization] || [];
   return [
-    validColor(player.color) ? player.color : civColor || "#777777",
+    validColor(player.color) ? player.color : civColor || replayPalette.player,
     validColor(player.secondaryColor)
       ? player.secondaryColor
-      : civSecondary || "#dddddd",
+      : civSecondary || replayPalette.playerSecondaryNeutral,
   ];
 }
 function renderTab(tab) {
+  if (activeTab === "map" && tab !== "map") {
+    const playToggle = replayTabCache.get("map")?.querySelector("#mapPlayToggle");
+    if (playToggle?.classList.contains("is-playing")) playToggle.click();
+  }
   activeTab = tab;
   $("#tabContent").classList.toggle("map-tab", tab === "map");
   const tabCard = $("#tabContent").closest(".card"),
     isWideMap = current?.kind === "replay" && tab === "map";
   tabCard?.classList.toggle("wide-map", isWideMap);
-  if (!isWideMap) tabCard?.style.removeProperty("width");
+  if (isWideMap && tabCard?.dataset.mapWidth)
+    tabCard.style.width = tabCard.dataset.mapWidth;
+  else if (!isWideMap) tabCard?.style.removeProperty("width");
   document
     .querySelectorAll(".tabs button")
     .forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
@@ -946,9 +1028,27 @@ function renderTab(tab) {
   const h = current.header,
     box = $("#tabContent");
   if (current.kind === "replay") {
-    renderReplayTab(tab, current, box);
+    if (replayTabCacheOwner !== current) {
+      replayTabCacheOwner = current;
+      replayTabCache.clear();
+      box.replaceChildren();
+      if (tabCard) delete tabCard.dataset.mapWidth;
+    }
+    let pane = replayTabCache.get(tab),
+      shouldRender = !pane;
+    if (!pane) {
+      pane = document.createElement("div");
+      pane.hidden = true;
+      replayTabCache.set(tab, pane);
+      box.append(pane);
+    }
+    for (const [name, cachedPane] of replayTabCache)
+      cachedPane.hidden = name !== tab;
+    if (shouldRender) renderReplayTab(tab, current, pane);
     return;
   }
+  replayTabCacheOwner = null;
+  replayTabCache.clear();
   const p = current.payload;
   const setLines = (lines) => (box.textContent = lines.join("\n"));
   if (tab === "summary")
@@ -1028,10 +1128,55 @@ function renderEventText(value) {
   );
 }
 function renderReplayTab(tab, d, box) {
-  const { header: h, replay: r } = d;
+  const { header: h, replay: r } = d,
+    playerByName = new Map(
+      h.players.flatMap((player) =>
+        [player.shortName, player.name].filter(Boolean).map((name) => [name, player]),
+      ),
+    );
   const text = (value) => {
     box.textContent = value;
   };
+  const isCityState = (player) =>
+    player?.civilization === "CIVILIZATION_MINOR" ||
+    (player?.civilization || "").startsWith("MINOR_CIV_");
+  const seriesColor = (player) => {
+    const color = player?.secondaryColor || player?.color;
+    return typeof color === "string" && /^#[\da-f]{6}$/i.test(color)
+      ? color
+      : replayPalette.replayFallback;
+  };
+  const seriesIcon = (player) => {
+    if (isCityState(player)) return "./assets/civ5-icons/CIV_CS_ICON.png";
+    const key = player?.iconKey || (player?.civilization || "").replace(/^CIVILIZATION_/, "").toLowerCase();
+    return player?.iconAvailable !== false && /^[a-z0-9_]+$/i.test(key)
+      ? `./assets/civ-icons/${key}.png`
+      : "./assets/civ5-icons/CIV_CITY_ICON.png";
+  };
+  const cityStateTraitIcon = (player) => {
+    if (!isCityState(player)) return "";
+    const traits = window.CIV5_CITY_STATE_TRAITS || {};
+    const names = [player?.shortName, player?.displayCiv, player?.name].filter(Boolean);
+    const trait = names
+      .map((name) => traits[name] || traits[name.toUpperCase().replace(/[ -]/g, "_")])
+      .find(Boolean);
+    if (!trait) return "";
+    const iconName = trait[0] + trait.slice(1).toLowerCase();
+    return `./assets/civ5-icons/${iconName}.png`;
+  };
+  const renderPlayerIcon = (player) => {
+    const isMinor = isCityState(player), traitIcon = cityStateTraitIcon(player);
+    const tint = isMinor && traitIcon
+      ? `<span class="event-series-icon-tint" style="--trait-icon:url('${traitIcon}');--series-color:${seriesColor(player)}"></span>`
+      : "";
+    return `<span class="event-series-icon-wrap"><img class="event-series-icon" src="${traitIcon || seriesIcon(player)}" alt="">${tint}${isMinor ? `<img class="event-series-trait" src="${seriesIcon(player)}" alt="City-state icon">` : ""}</span>`;
+  };
+  const playerLabel = (player, index) =>
+    player?.displayCiv || player?.shortName || player?.name || `Player ${index + 1}`;
+  const renderEventCivilization = (name, player) =>
+    player
+      ? `<span class="event-civ-cell">${renderPlayerIcon(player)}<span>${esc(name || playerLabel(player, 0))}</span></span>`
+      : esc(name || "");
   if (tab === "summary")
     return text(
       [
@@ -1094,51 +1239,73 @@ function renderReplayTab(tab, d, box) {
       ]),
     ));
   if (tab === "events") {
-    const isCityState = (player) =>
-      player?.civilization === "CIVILIZATION_MINOR" ||
-      (player?.civilization || "").startsWith("MINOR_CIV_");
+    const renderSeriesOption = ({ player, index }) => {
+      const isMinor = isCityState(player), label = playerLabel(player, index);
+      return `<label class="event-series-option" title="${esc(label)}">${renderPlayerIcon(player)}<span class="event-series-name"><i style="--series-color:${seriesColor(player)}"></i><span>${esc(label)}</span></span><input type="checkbox" data-series-player="${index}" ${isMinor ? "" : "checked"}></label>`;
+    };
     const metrics = r.metrics.map((m) => ({
       key: m.key,
-      byPlayer: m.byPlayer.map((samples) => samples.filter((point) => point.value !== 0)),
-    })).filter((m) => m.byPlayer.some((samples, player) => samples.length && !isCityState(h.players[player])));
-    box.innerHTML = `${metrics.length ? `<section class="event-chart-card"><div class="event-chart-head"><h3>Game metrics</h3><label class="metric-picker">Metric <select id="eventMetricSelect">${metrics.map((m, i) => `<option value="${i}">${esc(m.key)}</option>`).join("")}</select></label></div><div id="eventChart" class="event-chart"></div></section>` : ""}<h3 class="events-heading">Timeline</h3>${replayTable(
+      byPlayer: m.byPlayer.map((samples) =>
+        [...samples].sort((a, b) => a.turn - b.turn),
+      ),
+    })).filter((m) => m.byPlayer.some((samples) => samples.length));
+    const chartPlayers = h.players
+      .map((player, index) => ({ player, index }))
+      .filter(({ index }) => metrics.some((metric) => metric.byPlayer[index]?.length));
+    box.innerHTML = `${metrics.length ? `<section class="event-chart-card"><div class="event-chart-head"><label class="metric-picker"><select id="eventMetricSelect">${metrics.map((m, i) => `<option value="${i}">${esc(m.key)}</option>`).join("")}</select></label></div><div class="event-chart-layout"><aside class="event-series-panel"><div id="eventSeriesList" class="event-series-list">${chartPlayers.map(renderSeriesOption).join("")}</div></aside><div id="eventChart" class="event-chart"></div></div></section>` : ""}<h3 class="events-heading">Timeline</h3>${replayTable(
       ["Turn", "Year", "Type", "Civilization", "Location", "Event"],
       r.events
-        .map((e) => [
-          e.turn,
-          replayYear(h, e.turn),
-          e.type,
-          e.civ,
-          e.x === undefined ? "" : `${e.x}, ${e.y}`,
-          { trustedHtml: true, value: renderEventText(e.text) },
-        ])
+        .map((e) => {
+          const owner = playerByName.get(e.civ);
+          return [
+            e.turn,
+            replayYear(h, e.turn),
+            e.type,
+            { trustedHtml: true, value: renderEventCivilization(e.civ, owner) },
+            e.x === undefined ? "" : `${e.x}, ${e.y}`,
+            { trustedHtml: true, value: renderEventText(e.text) },
+          ];
+        })
         .sort((a, b) => a[0] - b[0]),
     )}`;
     const eventMetricSelect = box.querySelector("#eventMetricSelect"),
-      eventChart = box.querySelector("#eventChart");
+      eventChart = box.querySelector("#eventChart"),
+      eventSeriesList = box.querySelector("#eventSeriesList");
     if (eventMetricSelect && eventChart) {
+      const enabledPlayers = new Set(
+        chartPlayers.filter(({ player }) => !isCityState(player)).map(({ index }) => index),
+      );
       const drawEventChart = () => {
         const metric = metrics[Number(eventMetricSelect.value)],
-          width = 900, height = 290, pad = { left: 54, right: 22, top: 20, bottom: 38 },
-          points = metric.byPlayer.flatMap((samples, player) => isCityState(h.players[player]) ? [] : samples),
+          width = 900, height = 360, pad = { left: 54, right: 55, top: 20, bottom: 38 },
+          visible = metric.byPlayer
+            .map((samples, player) => ({ samples, player }))
+            .filter(({ samples, player }) => samples.length && enabledPlayers.has(player)),
+          points = visible.flatMap(({ samples }) => samples),
           minTurn = h.startTurn, maxTurn = Math.max(minTurn + 1, h.endTurn),
           minValue = Math.min(0, ...points.map((point) => point.value)),
           maxValue = Math.max(1, ...points.map((point) => point.value)),
           x = (turn) => pad.left + (turn - minTurn) / (maxTurn - minTurn) * (width - pad.left - pad.right),
           y = (value) => height - pad.bottom - (value - minValue) / (maxValue - minValue || 1) * (height - pad.top - pad.bottom),
-          colors = h.players.map((player) => player.color || "#88754e"),
-          lines = metric.byPlayer.map((samples, player) => {
-            if (!samples.length || isCityState(h.players[player])) return "";
-            const sorted = [...samples].sort((a, b) => a.turn - b.turn);
-            return `<path d="${sorted.map((point, i) => `${i ? "L" : "M"}${x(point.turn).toFixed(1)},${y(point.value).toFixed(1)}`).join(" ")}" fill="none" stroke="${colors[player]}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"><title>${esc(h.players[player]?.displayCiv || h.players[player]?.shortName || `Player ${player + 1}`)}</title></path>`;
+          yTicks = [0, .25, .5, .75, 1].map((t) => minValue + (maxValue - minValue) * t),
+          lines = visible.map(({ samples, player }) => {
+            return `<path class="event-series-line" style="--series-color:${seriesColor(h.players[player])}" d="${samples.map((point, i) => `${i ? "L" : "M"}${x(point.turn).toFixed(1)},${y(point.value).toFixed(1)}`).join(" ")}" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"><title>${esc(h.players[player]?.displayCiv || h.players[player]?.shortName || `Player ${player + 1}`)}</title></path>`;
           }).join(""),
-          ticks = [0, .25, .5, .75, 1].map((t) => {
-            const value = minValue + (maxValue - minValue) * t, yy = y(value);
-            return `<line x1="${pad.left}" x2="${width - pad.right}" y1="${yy}" y2="${yy}" class="chart-gridline"/><text x="${pad.left - 9}" y="${yy + 4}" text-anchor="end" class="chart-axis-label">${Math.round(value).toLocaleString()}</text>`;
+          ticks = yTicks.map((value) => {
+            const yy = y(value);
+            return `<line x1="${pad.left}" x2="${width - pad.right}" y1="${yy}" y2="${yy}" class="chart-gridline"/><text x="${width - pad.right + 9}" y="${yy + 4}" class="chart-axis-label">${Math.round(value).toLocaleString()}</text>`;
           }).join("");
-        eventChart.innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(metric.key)} by turn">${ticks}<line x1="${pad.left}" x2="${width - pad.right}" y1="${height - pad.bottom}" y2="${height - pad.bottom}" class="chart-axis"/><text x="${pad.left}" y="${height - 10}" class="chart-axis-label">Turn ${minTurn}</text><text x="${width - pad.right}" y="${height - 10}" text-anchor="end" class="chart-axis-label">Turn ${h.endTurn}</text>${lines}</svg><div class="event-chart-legend">${metric.byPlayer.map((samples, player) => samples.length && !isCityState(h.players[player]) ? `<span><i style="--series-color:${colors[player]}"></i>${esc(h.players[player]?.displayCiv || h.players[player]?.shortName || `Player ${player + 1}`)}</span>` : "").join("")}</div>`;
+        eventChart.innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img"><rect class="chart-plot-bg" x="1" y="1" width="${width - 2}" height="${height - 2}"/>${ticks}<line x1="${pad.left}" x2="${width - pad.right}" y1="${height - pad.bottom}" y2="${height - pad.bottom}" class="chart-axis"/><text x="${pad.left}" y="${height - 10}" class="chart-axis-label">${esc(replayYear(h, minTurn))}</text><text x="${width - pad.right}" y="${height - 10}" text-anchor="end" class="chart-axis-label">${esc(replayYear(h, h.endTurn))}</text>${lines}</svg>${visible.length ? "" : '<div class="event-chart-empty">Select a civilization</div>'}`;
       };
       eventMetricSelect.addEventListener("change", drawEventChart);
+      eventSeriesList?.querySelectorAll("[data-series-player]").forEach((input) =>
+        input.addEventListener("change", () => {
+          const player = Number(input.dataset.seriesPlayer);
+          if (input.checked) enabledPlayers.add(player);
+          else enabledPlayers.delete(player);
+          drawEventChart();
+        }),
+      );
       drawEventChart();
     }
     box
@@ -1174,7 +1341,7 @@ function renderReplayTab(tab, d, box) {
           .map((x) => [
             x.turn,
             replayYear(h, x.turn),
-            h.players[x.player]?.name || `Player ${x.player + 1}`,
+            { trustedHtml: true, value: renderEventCivilization(playerLabel(h.players[x.player], x.player), h.players[x.player]) },
             x.value,
           ]),
       );
@@ -1196,7 +1363,18 @@ function renderReplayTab(tab, d, box) {
       Math.min(1, Math.max(h.startTurn, h.endTurn)),
     );
     const canvasY = (row) => canvasHeight - radius - radius * 1.5 * row;
+    const territoryTiles = r.tiles.map((_, i) => {
+      const x = i % r.mapWidth,
+        y = Math.floor(i / r.mapWidth),
+        cx = radius + hexW * (x + 0.5 * (y & 1)),
+        cy = canvasY(y),
+        neighbors = y & 1
+          ? [[x + 1, y, 0], [x + 1, y + 1, 5], [x, y + 1, 4], [x - 1, y, 3], [x, y - 1, 2], [x + 1, y - 1, 1]]
+          : [[x + 1, y, 0], [x, y + 1, 5], [x - 1, y + 1, 4], [x - 1, y, 3], [x - 1, y - 1, 2], [x, y - 1, 1]];
+      return { x, y, key: `${x},${y}`, cx, cy, neighbors };
+    });
     mapCard.style.width = `min(${Math.max(contentGridWidth, canvasWidth + 36)}px,calc(100vw - 24px))`;
+    mapCard.dataset.mapWidth = mapCard.style.width;
     mapCard.style.boxSizing = "border-box";
     const terrainLegend = [
       ["GRASSLAND", "Grassland"],
@@ -1214,7 +1392,7 @@ function renderReplayTab(tab, d, box) {
       if (localStorage.getItem(opacityKey) !== null && Number.isFinite(stored))
         initialTerritoryOpacity = Math.max(0, Math.min(100, stored));
     } catch {}
-    box.innerHTML = `<label class="metric-picker">Turn <input id="mapTurn" type="range" min="${h.startTurn}" max="${Math.max(h.startTurn, h.endTurn)}" value="${initialMapTurn}"><b id="mapTurnLabel">${initialMapTurn}</b></label><div class="replay-map-wrap"><div id="mapWorld" class="map-world" style="width:min(${canvasWidth}px,100%);aspect-ratio:${canvasWidth}/${canvasHeight}"><canvas class="map-layer-canvas" data-map-layer="terrain" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="elevation" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="features" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="grid" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="territory" width="${canvasWidth}" height="${canvasHeight}"></div><div id="mapTileTooltip" class="map-tile-tooltip" hidden></div><div class="map-zoom-controls"><button type="button" data-zoom="out" aria-label="Zoom out">−</button><button type="button" data-zoom="reset" aria-label="Reset zoom">100%</button><button type="button" data-zoom="in" aria-label="Zoom in">+</button></div></div><div class="map-layer-controls"><span>Layers</span>${[
+    box.innerHTML = `<div class="map-timeline"><button id="mapPlayToggle" class="map-play-toggle" type="button" title="Play map history"><svg class="play-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg><svg class="pause-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2h4v12H3zm6 0h4v12H9z"/></svg></button><label class="metric-picker">Turn <input id="mapTurn" type="range" min="${h.startTurn}" max="${Math.max(h.startTurn, h.endTurn)}" value="${initialMapTurn}"><b id="mapTurnLabel">${initialMapTurn}</b></label><button id="mapExport" class="map-export-button" type="button">Render video</button><span id="mapExportStatus" role="status" aria-live="polite"></span></div><div class="replay-map-wrap"><div id="mapWorld" class="map-world" style="width:min(${canvasWidth}px,100%);aspect-ratio:${canvasWidth}/${canvasHeight}"><canvas class="map-layer-canvas" data-map-layer="terrain" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="elevation" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="features" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="grid" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="territory" width="${canvasWidth}" height="${canvasHeight}"></div><div id="mapTileTooltip" class="map-tile-tooltip" hidden></div><div class="map-zoom-controls"><button type="button" data-zoom="out">−</button><button type="button" data-zoom="reset">100%</button><button type="button" data-zoom="in">+</button></div></div><div class="map-layer-controls"><span>Layers</span>${[
       ["terrain", "Terrain"],
       ["elevation", "Elevation"],
       ["features", "Features"],
@@ -1231,13 +1409,16 @@ function renderReplayTab(tab, d, box) {
     const world = box.querySelector("#mapWorld"),
       viewport = world.parentElement,
       range = box.querySelector("#mapTurn"),
+      playToggle = box.querySelector("#mapPlayToggle"),
+      exportButton = box.querySelector("#mapExport"),
+      exportStatus = box.querySelector("#mapExportStatus"),
       opacityRange = box.querySelector("#territoryOpacity"),
       tooltip = box.querySelector("#mapTileTooltip"),
       zoomReadout = box.querySelector('[data-zoom="reset"]'),
       layers = Object.fromEntries(
         [...box.querySelectorAll(".map-layer-canvas")].map((canvas) => [
           canvas.dataset.mapLayer,
-          { canvas, ctx: canvas.getContext("2d") },
+          { canvas, ctx: canvas.getContext("2d", { willReadFrequently: true }) },
         ]),
       );
     const renderScale = Math.min(
@@ -1269,6 +1450,28 @@ function renderReplayTab(tab, d, box) {
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = "high";
     }
+    const replayPlayers = new Map();
+    for (const player of h.players) {
+      if (player.shortName) replayPlayers.set(player.shortName, player);
+      if (player.name) replayPlayers.set(player.name, player);
+    }
+    const applyMapEvent = (e, owners, cities) => {
+      if (e.type === "CITY_FOUNDED" && e.x !== undefined) {
+        const key = `${e.x},${e.y}`;
+        owners.set(key, e.civ || "");
+        cities.set(key, { x: Number(e.x), y: Number(e.y), owner: e.civ || "", eventText: e.text || "" });
+      } else if (e.type === "CITY_RAZED") {
+        for (const tile of e.tiles) cities.delete(`${tile.x},${tile.y}`);
+      } else if (e.type === "CITIES_TRANSFERRED") {
+        for (const tile of e.tiles) {
+          owners.set(`${tile.x},${tile.y}`, e.civ || "");
+          const city = cities.get(`${tile.x},${tile.y}`);
+          if (city) city.owner = e.civ || "";
+        }
+      } else if (e.type === "TILES_CLAIMED") {
+        for (const tile of e.tiles) owners.set(`${tile.x},${tile.y}`, e.civ || "");
+      }
+    };
     let territoryOpacity = Number(opacityRange.value),
       currentOwners = new Map(),
       currentCities = new Map(),
@@ -1503,7 +1706,7 @@ function renderReplayTab(tab, d, box) {
           riverPattern,
         );
         traceReplayHex(layers.grid.ctx, cx, cy, radius);
-        layers.grid.ctx.strokeStyle = "rgba(20,24,22,.16)";
+        layers.grid.ctx.strokeStyle = replayPalette.mapGrid;
         layers.grid.ctx.lineWidth = 0.5;
         layers.grid.ctx.stroke();
       });
@@ -1515,46 +1718,26 @@ function renderReplayTab(tab, d, box) {
       if (box.contains(world)) drawStaticLayers();
     });
     viewport.addEventListener("dragstart", (event) => event.preventDefault());
-    const drawTerritory = () => {
+    const drawTerritory = (state) => {
       const ctx = layers.territory.ctx;
       ctx.clearRect(0, 0, canvasWidth, canvasHeight);
-      const owners = new Map(),
-        cities = new Map(),
+      const owners = state?.owners || new Map(),
+        cities = state?.cities || new Map(),
         turn = Number(range.value);
-      for (const e of r.events) {
-        if (e.turn > turn) break;
-        if (e.type === "CITY_FOUNDED" && e.x !== undefined) {
-          owners.set(`${e.x},${e.y}`, e.civ || "");
-          cities.set(`${e.x},${e.y}`, {
-            owner: e.civ || "",
-            eventText: e.text || "",
-          });
-        } else if (e.type === "CITY_RAZED") {
-          for (const tile of e.tiles) cities.delete(`${tile.x},${tile.y}`);
-        } else if (e.type === "CITIES_TRANSFERRED") {
-          for (const tile of e.tiles) {
-            owners.set(`${tile.x},${tile.y}`, e.civ || "");
-            const city = cities.get(`${tile.x},${tile.y}`);
-            if (city) city.owner = e.civ || "";
-          }
-        } else if (e.type === "TILES_CLAIMED") {
-          for (const t of e.tiles) owners.set(`${t.x},${t.y}`, e.civ || "");
+      if (!state) {
+        for (const e of r.events) {
+          if (e.turn > turn) break;
+          applyMapEvent(e, owners, cities);
         }
       }
       currentOwners = owners;
       currentCities = cities;
-      r.tiles.forEach((tile, i) => {
-        const x = i % r.mapWidth,
-          y = Math.floor(i / r.mapWidth),
-          owner = owners.get(`${x},${y}`),
-          player = h.players.find(
-            (p) => p.shortName === owner || p.name === owner,
-          );
+      territoryTiles.forEach(({ key, cx, cy }) => {
+        const owner = owners.get(key),
+          player = replayPlayers.get(owner);
         if (!player) return;
-        const cx = radius + hexW * (x + 0.5 * (y & 1)),
-          cy = canvasY(y);
         traceReplayHex(ctx, cx, cy, radius);
-        const city = cities.get(`${x},${y}`),
+        const city = cities.get(key),
           isCityState =
             player.civilization === "CIVILIZATION_MINOR" ||
             (player.civilization || "").startsWith("MINOR_CIV_"),
@@ -1566,46 +1749,23 @@ function renderReplayTab(tab, d, box) {
         ctx.fillStyle = isCityState
           ? city
             ? cityColor
-            : "#000"
+            : replayPalette.unclaimedMinor
           : isMajorCity
             ? player.color
             : cityColor;
         ctx.fill();
       });
-      r.tiles.forEach((tile, i) => {
-        const x = i % r.mapWidth,
-          y = Math.floor(i / r.mapWidth),
-          owner = owners.get(`${x},${y}`);
+      territoryTiles.forEach(({ key, cx, cy, neighbors }) => {
+        const owner = owners.get(key);
         if (!owner) return;
-        const player = h.players.find(
-            (p) => p.shortName === owner || p.name === owner,
-          );
+        const player = replayPlayers.get(owner);
         if (!player) return;
         const isCityState =
             player.civilization === "CIVILIZATION_MINOR" ||
             (player.civilization || "").startsWith("MINOR_CIV_"),
           borderColor = isCityState
             ? player.secondaryColor || player.color
-            : player.color,
-          cx = radius + hexW * (x + 0.5 * (y & 1)),
-          cy = canvasY(y),
-          neighbors = y & 1
-            ? [
-                [x + 1, y, 0],
-                [x + 1, y + 1, 5],
-                [x, y + 1, 4],
-                [x - 1, y, 3],
-                [x, y - 1, 2],
-                [x + 1, y - 1, 1],
-              ]
-            : [
-                [x + 1, y, 0],
-                [x, y + 1, 5],
-                [x - 1, y + 1, 4],
-                [x - 1, y, 3],
-                [x - 1, y - 1, 2],
-                [x, y - 1, 1],
-              ];
+            : player.color;
         ctx.strokeStyle = borderColor;
         ctx.lineWidth = 1.5;
         for (const [neighborX, neighborY, side] of neighbors) {
@@ -1624,13 +1784,10 @@ function renderReplayTab(tab, d, box) {
           }
         }
       });
-      for (const [key, city] of cities) {
-        const [x, y] = key.split(",").map(Number),
-          cx = radius + hexW * (x + 0.5 * (y & 1)),
-          cy = canvasY(y),
-          player = h.players.find(
-            (p) => p.shortName === city.owner || p.name === city.owner,
-          );
+      for (const city of cities.values()) {
+        const cx = radius + hexW * (city.x + 0.5 * (city.y & 1)),
+          cy = canvasY(city.y),
+          player = replayPlayers.get(city.owner);
         if (
           player?.civilization === "CIVILIZATION_MINOR" ||
           (player?.civilization || "").startsWith("MINOR_CIV_")
@@ -1659,12 +1816,12 @@ function renderReplayTab(tab, d, box) {
           } else {
             ctx.beginPath();
             ctx.arc(cx, cy, 5.5, 0, Math.PI * 2);
-            ctx.fillStyle = player?.color || "#f4ead0";
+            ctx.fillStyle = player?.color || replayPalette.cityMarker;
             ctx.fill();
             ctx.lineWidth = 1.5;
-            ctx.strokeStyle = "#fffdf8";
+            ctx.strokeStyle = replayPalette.cityMarkerStroke;
             ctx.stroke();
-            ctx.fillStyle = "#282820";
+            ctx.fillStyle = replayPalette.cityMarkerDetail;
             ctx.fillRect(cx - 2, cy - 1.5, 4, 4);
             ctx.fillRect(cx - 3.5, cy + 1, 7, 1.5);
           }
@@ -1693,9 +1850,7 @@ function renderReplayTab(tab, d, box) {
         y = Math.floor(tileIndex / r.mapWidth),
         owner = currentOwners.get(`${x},${y}`),
         city = currentCities.get(`${x},${y}`),
-        player = h.players.find(
-          (p) => p.shortName === owner || p.name === owner,
-        ),
+        player = replayPlayers.get(owner),
         details = [
           `Tile ${x + 1}, ${y + 1}`,
           replayTerrainLabel(tile.typeId),
@@ -1732,6 +1887,206 @@ function renderReplayTab(tab, d, box) {
       tooltip.hidden = true;
       drawTerritory();
     });
+    let playbackTimer = 0;
+    const setPlaying = (playing) => {
+      clearInterval(playbackTimer);
+      playToggle.classList.toggle("is-playing", playing);
+      playToggle.title = playing ? "Pause map history" : "Play map history";
+      if (playing) playbackTimer = setInterval(() => {
+        if (Number(range.value) >= Number(range.max)) return setPlaying(false);
+        range.value = String(Number(range.value) + 1);
+        range.dispatchEvent(new Event("input", { bubbles: true }));
+      }, 250);
+    };
+    playToggle.addEventListener("click", () => setPlaying(!playToggle.classList.contains("is-playing")));
+    range.addEventListener("input", () => {
+      if (Number(range.value) >= Number(range.max)) setPlaying(false);
+    });
+    const exportDialog = document.createElement("dialog");
+    const exportSourceCanvas = Object.values(layers)[0].canvas;
+    exportDialog.className = "map-export-dialog";
+    exportDialog.innerHTML = `<form class="map-export-form"><div class="map-export-heading"><h3>Video export settings</h3><button class="map-export-close" type="button">×</button></div><label>Duration per turn <span><input name="frameDuration" type="range" min="50" max="1000" step="50" value="250"><b data-value="frameDuration">250 ms</b></span></label><label>Bitrate <span><input name="bitrate" type="range" min="500000" max="12000000" step="250000" value="2500000"><b data-value="bitrate">2.5 Mbps</b></span></label><label>Maximum width <select name="maxWidth"><option value="0">Original</option><option value="2560">2560 px</option><option value="1920">1920 px</option><option value="1280">1280 px</option></select></label><label>Codec <select name="codec"><option value="auto">Automatic (VP9 preferred)</option><option value="vp9">VP9</option><option value="vp8">VP8</option></select></label><div class="map-export-estimate"><span>Frame rate</span><b data-estimate="fps">4 fps</b><span>Output resolution</span><b data-estimate="resolution">—</b><span>Video duration</span><b data-estimate="duration">—</b></div><div class="map-export-actions"><button type="button" data-action="cancel">Cancel</button><button type="submit">Render &amp; download</button></div></form>`;
+    box.append(exportDialog);
+    const exportForm = exportDialog.querySelector("form"),
+      frameDurationInput = exportForm.elements.frameDuration,
+      bitrateInput = exportForm.elements.bitrate,
+      maxWidthInput = exportForm.elements.maxWidth,
+      exportDimensions = (maxWidth) => {
+        const widthLimit = Number(maxWidth) || exportSourceCanvas.width,
+          width = Math.max(2, Math.min(exportSourceCanvas.width, widthLimit) - Math.min(exportSourceCanvas.width, widthLimit) % 2);
+        return { width, height: Math.max(2, Math.round(exportSourceCanvas.height * width / exportSourceCanvas.width / 2) * 2) };
+      },
+      composeExportBackground = (canvas, context, layers) => {
+        context.fillStyle = cssColor("--surface") || "#fffdf8";
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        for (const layer of layers) {
+          if (layer.dataset.mapLayer !== "territory")
+            context.drawImage(layer, 0, 0, canvas.width, canvas.height);
+        }
+      },
+      composeExportFrame = (output, context, background, territoryLayer) => {
+        context.drawImage(background, 0, 0);
+        if (!territoryLayer.hidden) {
+          context.globalAlpha = territoryOpacity / 100;
+          context.drawImage(territoryLayer, 0, 0, output.width, output.height);
+        }
+        context.globalAlpha = 1;
+      },
+      updateExportEstimate = () => {
+        const turns = Number(h.endTurn) - Number(h.startTurn) + 1,
+          durationMs = turns * Number(frameDurationInput.value),
+          { width, height } = exportDimensions(maxWidthInput.value),
+          minutes = Math.floor(durationMs / 60_000),
+          seconds = Math.floor(durationMs / 1_000) % 60;
+        exportDialog.querySelector('[data-value="frameDuration"]').textContent = `${frameDurationInput.value} ms`;
+        exportDialog.querySelector('[data-value="bitrate"]').textContent = `${(Number(bitrateInput.value) / 1_000_000).toFixed(2).replace(/0+$/, "").replace(/\.$/, "")} Mbps`;
+        exportDialog.querySelector('[data-estimate="fps"]').textContent = `${(1000 / Number(frameDurationInput.value)).toFixed(0)} fps`;
+        exportDialog.querySelector('[data-estimate="resolution"]').textContent = `${width} × ${height}`;
+        exportDialog.querySelector('[data-estimate="duration"]').textContent = `${minutes}:${String(seconds).padStart(2, "0")}`;
+      };
+    frameDurationInput.addEventListener("input", updateExportEstimate);
+    bitrateInput.addEventListener("input", updateExportEstimate);
+    maxWidthInput.addEventListener("change", updateExportEstimate);
+    exportButton.addEventListener("click", () => {
+      if (location.protocol === "file:") {
+        showNotification("Video export is unavailable when this page is opened directly from disk. Open it through a local HTTP server and try again.");
+        return;
+      }
+      updateExportEstimate();
+      exportDialog.showModal();
+    });
+    const closeExportDialog = () => exportDialog.close();
+    exportDialog.querySelector('[data-action="cancel"]').addEventListener("click", closeExportDialog);
+    exportDialog.querySelector(".map-export-close").addEventListener("click", closeExportDialog);
+    exportDialog.addEventListener("click", (event) => {
+      if (event.target === exportDialog) closeExportDialog();
+    });
+    const runExport = async ({ frameDuration, bitrate, maxWidth, codecPreference }) => {
+      if (!window.VideoFrame || !window.VideoEncoder || !window.ReplayWebMMuxer) {
+        exportStatus.textContent = "WebCodecs video export is not supported in this browser.";
+        return;
+      }
+      setPlaying(false);
+      exportButton.disabled = true;
+      playToggle.disabled = true;
+      range.disabled = true;
+      const savedTurn = range.value,
+        output = document.createElement("canvas"),
+        background = document.createElement("canvas"),
+        mapLayers = [...world.querySelectorAll(".map-layer-canvas")].filter((canvas) => !canvas.hidden),
+        outputWidth = Math.max(2, Math.min(exportSourceCanvas.width, maxWidth || exportSourceCanvas.width) - Math.min(exportSourceCanvas.width, maxWidth || exportSourceCanvas.width) % 2),
+        outputHeight = Math.max(2, Math.round(exportSourceCanvas.height * outputWidth / exportSourceCanvas.width / 2) * 2),
+        context = output.getContext("2d");
+      output.width = outputWidth;
+      output.height = outputHeight;
+      background.width = outputWidth;
+      background.height = outputHeight;
+      composeExportBackground(background, background.getContext("2d"), mapLayers);
+      let encoder;
+      try {
+        for (const canvas of world.querySelectorAll(".map-layer-canvas")) {
+          try {
+            canvas.getContext("2d").getImageData(0, 0, 1, 1);
+          } catch {
+            const layer = canvas.dataset.mapLayer || "map";
+            throw new Error(
+              `The ${layer} layer contains an image the browser cannot export. Open this page through its local HTTP server (http://localhost), then reload and try again.`,
+            );
+          }
+        }
+        const totalFrames = Number(h.endTurn) - Number(h.startTurn) + 1,
+          fps = 1000 / frameDuration,
+          keyFrameInterval = Math.max(1, Math.round(30_000 / frameDuration)),
+          config = { width: outputWidth, height: outputHeight, bitrate, framerate: fps };
+        let supportedConfig = null, codec = "vp9", encoderError = null;
+        const codecCandidates = codecPreference === "vp9"
+          ? ["vp09.00.10.08"]
+          : codecPreference === "vp8"
+            ? ["vp8"]
+            : ["vp09.00.10.08", "vp8"];
+        for (const candidate of codecCandidates) {
+          const result = await VideoEncoder.isConfigSupported({ ...config, codec: candidate });
+          if (result.supported) {
+            supportedConfig = result.config;
+            codec = candidate === "vp8" ? "vp8" : "vp9";
+            break;
+          }
+        }
+        if (!supportedConfig) throw new Error("This browser has no supported VP8 or VP9 video encoder.");
+        const muxer = new ReplayWebMMuxer(outputWidth, outputHeight, fps, codec);
+        encoder = new VideoEncoder({
+          output: (chunk) => {
+            const data = new Uint8Array(chunk.byteLength);
+            chunk.copyTo(data);
+            muxer.addFrame(chunk.timestamp, chunk.type === "key", data);
+          },
+          error: (error) => { encoderError = error; },
+        });
+        encoder.configure(supportedConfig);
+        const exportState = { owners: new Map(), cities: new Map() };
+        const territoryEventTypes = new Set(["CITY_FOUNDED", "CITY_RAZED", "CITIES_TRANSFERRED", "TILES_CLAIMED"]);
+        let eventIndex = 0;
+        for (let turn = Number(h.startTurn); turn <= Number(h.endTurn); turn++) {
+          range.value = String(turn);
+          let territoryChanged = turn === Number(h.startTurn);
+          while (eventIndex < r.events.length && r.events[eventIndex].turn <= turn) {
+            const mapEvent = r.events[eventIndex++];
+            territoryChanged ||= territoryEventTypes.has(mapEvent.type);
+            applyMapEvent(mapEvent, exportState.owners, exportState.cities);
+          }
+          if (territoryChanged) drawTerritory(exportState);
+          box.querySelector("#mapTurnLabel").textContent = turn;
+          composeExportFrame(output, context, background, layers.territory.canvas);
+          const frameIndex = turn - Number(h.startTurn),
+            frame = new VideoFrame(output, { timestamp: frameIndex * frameDuration * 1_000, duration: frameDuration * 1_000 });
+          encoder.encode(frame, { keyFrame: frameIndex % keyFrameInterval === 0 });
+          frame.close();
+          if (frameIndex % 8 === 0 || frameIndex + 1 === totalFrames)
+            exportStatus.textContent = `Rendering frame ${frameIndex + 1} of ${totalFrames}…`;
+          if (encoder.encodeQueueSize >= 8)
+            await new Promise((resolve) => encoder.addEventListener("dequeue", resolve, { once: true }));
+          if (frameIndex % 8 === 7) {
+            if (typeof globalThis.scheduler?.yield === "function") await globalThis.scheduler.yield();
+            else await new Promise((resolve) => setTimeout(resolve, 0));
+          }
+        }
+        await encoder.flush();
+        encoder.close();
+        if (encoderError) throw encoderError;
+        if (muxer.frames.length !== totalFrames)
+          throw new Error(`The encoder returned ${muxer.frames.length} of ${totalFrames} frames.`);
+        const blob = muxer.finish();
+        if (!blob.size) throw new Error("The rendered video is empty.");
+        const url = URL.createObjectURL(blob),
+          link = document.createElement("a");
+        link.href = url;
+        link.download = `${d.file.name.replace(/\.Civ5Replay$/i, "")}.webm`;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      } catch (error) {
+        exportStatus.textContent = error.message || "Video rendering failed.";
+      } finally {
+        if (encoder && encoder.state !== "closed") encoder.close();
+        range.value = savedTurn;
+        drawTerritory();
+        exportButton.disabled = false;
+        playToggle.disabled = false;
+        range.disabled = false;
+      }
+    };
+    exportForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const settings = {
+        frameDuration: Number(frameDurationInput.value),
+        bitrate: Number(bitrateInput.value),
+        maxWidth: Number(exportForm.elements.maxWidth.value),
+        codecPreference: exportForm.elements.codec.value,
+      };
+      exportDialog.close();
+      await runExport(settings);
+    });
     drawTerritory();
     cityIcons.ready.then(() => {
       if (box.contains(world)) drawTerritory();
@@ -1748,17 +2103,7 @@ function replayYear(h, turn) {
     : "";
 }
 function terrainColor(id) {
-  return (
-    [
-      "#73863a",
-      "#92844b",
-      "#c6a65c",
-      "#76766c",
-      "#e8e7dc",
-      "#5a9997",
-      "#315167",
-    ][id] || "#a58aa8"
-  );
+  return replayPalette.terrain[id] || replayPalette.terrainFallback;
 }
 function traceReplayHex(ctx, cx, cy, radius) {
   ctx.beginPath();
@@ -1798,13 +2143,13 @@ function drawReplayRiver(ctx, cx, cy, radius, mask, texture) {
     ctx.beginPath();
     ctx.moveTo(...start);
     ctx.lineTo(...end);
-    ctx.strokeStyle = "rgba(29,62,62,.62)";
+    ctx.strokeStyle = replayPalette.riverShadow;
     ctx.lineWidth = 4.2;
     ctx.stroke();
-    ctx.strokeStyle = texture || "#5a918d";
+    ctx.strokeStyle = texture || replayPalette.riverWater;
     ctx.lineWidth = 2.8;
     ctx.stroke();
-    ctx.strokeStyle = "rgba(190,220,205,.62)";
+    ctx.strokeStyle = replayPalette.riverHighlight;
     ctx.lineWidth = 0.75;
     ctx.stroke();
   }
