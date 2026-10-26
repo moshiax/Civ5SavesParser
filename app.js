@@ -25,6 +25,7 @@ const cityStateTraits = Object.fromEntries(
   ]),
 );
 const $ = (s) => document.querySelector(s);
+const metricLabel = (key) => key.replace(/^(?:REPLAYDATASET|INFOADDICTDATASET)_/, "");
 const cssColor = (name) =>
   getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 const replayPalette = {
@@ -51,8 +52,13 @@ const drop = $("#dropzone"),
   input = $("#fileInput");
 let current = null,
   activeTab = "summary";
-let replayTabCacheOwner = null;
-const replayTabCache = new Map();
+let replaySectionsOwner = null;
+const replaySections = new Map();
+const replaySectionContents = new Map();
+const replaySectionsRendered = new Set();
+let replayBuildGeneration = 0;
+let eventReturnScrollY = null;
+let replayMapNavigator = null;
 let dragDepth = 0;
 const themeToggle = $("#themeToggle"),
   themePreference = window.matchMedia?.("(prefers-color-scheme: dark)");
@@ -612,7 +618,12 @@ function parseReplay(bytes, filename) {
   );
   const metricData = datasetKeys.map((key, index) => ({
     key,
-    byPlayer: datasetValues.map((player) => player[index] || []),
+    byPlayer: datasetValues.map((player) =>
+      (player[index] || []).map((sample) => ({
+        ...sample,
+        turn: sample.turn + startTurn,
+      })),
+    ),
   }));
   i32();
   const events = array(
@@ -1008,19 +1019,8 @@ function civBadgeColors(player) {
       : civSecondary || replayPalette.playerSecondaryNeutral,
   ];
 }
-function renderTab(tab) {
-  if (activeTab === "map" && tab !== "map") {
-    const playToggle = replayTabCache.get("map")?.querySelector("#mapPlayToggle");
-    if (playToggle?.classList.contains("is-playing")) playToggle.click();
-  }
+function renderTab(tab, { navigate = false } = {}) {
   activeTab = tab;
-  $("#tabContent").classList.toggle("map-tab", tab === "map");
-  const tabCard = $("#tabContent").closest(".card"),
-    isWideMap = current?.kind === "replay" && tab === "map";
-  tabCard?.classList.toggle("wide-map", isWideMap);
-  if (isWideMap && tabCard?.dataset.mapWidth)
-    tabCard.style.width = tabCard.dataset.mapWidth;
-  else if (!isWideMap) tabCard?.style.removeProperty("width");
   document
     .querySelectorAll(".tabs button")
     .forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
@@ -1028,33 +1028,124 @@ function renderTab(tab) {
   const h = current.header,
     box = $("#tabContent");
   if (current.kind === "replay") {
-    if (replayTabCacheOwner !== current) {
-      replayTabCacheOwner = current;
-      replayTabCache.clear();
-      box.replaceChildren();
-      if (tabCard) delete tabCard.dataset.mapWidth;
+    const sectionsBox = $("#tabSections"),
+      fallbackCard = $("#tabContentCard");
+    fallbackCard.hidden = true;
+    sectionsBox.hidden = false;
+    if (replaySectionsOwner !== current) {
+      replaySectionsOwner = current;
+      replaySections.clear();
+      replaySectionContents.clear();
+      replaySectionsRendered.clear();
+      replayMapNavigator = null;
+      eventReturnScrollY = null;
+      const buildGeneration = ++replayBuildGeneration;
+      sectionsBox.replaceChildren();
+      const titles = {
+        map: "Map history",
+        history: "Turn history",
+        events: "Events",
+        players: "Players",
+        metadata: "Metadata",
+      };
+      const order = ["map", "events", "history", "players", "metadata"];
+      for (const name of order) {
+        const button = document.querySelector(`.tabs button[data-tab="${name}"]`);
+        if (!button || button.hidden) continue;
+        const section = document.createElement("section");
+        section.className = `card replay-section${name === "map" ? " replay-map-section wide-map" : ""}`;
+        section.id = `replay-section-${name}`;
+        const content = document.createElement("div");
+        content.className = "raw";
+        section.setAttribute("aria-label", titles[name]);
+        section.append(content);
+        sectionsBox.append(section);
+        replaySections.set(name, section);
+        replaySectionContents.set(name, content);
+      }
+      const renderSection = (name) => {
+        if (replaySectionsRendered.has(name)) return;
+        const content = replaySectionContents.get(name);
+        if (!content) return;
+        replaySectionsRendered.add(name);
+        renderReplayTab(name, current, content);
+      };
+      renderSection("map");
+      const buildNextSection = () => {
+        if (buildGeneration !== replayBuildGeneration || replaySectionsOwner !== current) return;
+        const next = order.find((name) => replaySections.has(name) && !replaySectionsRendered.has(name));
+        if (!next) return;
+        renderSection(next);
+        if (window.requestIdleCallback)
+          window.requestIdleCallback(buildNextSection, { timeout: 500 });
+        else setTimeout(buildNextSection, 0);
+      };
+      if (window.requestIdleCallback)
+        window.requestIdleCallback(buildNextSection, { timeout: 500 });
+      else setTimeout(buildNextSection, 0);
     }
-    let pane = replayTabCache.get(tab),
-      shouldRender = !pane;
-    if (!pane) {
-      pane = document.createElement("div");
-      pane.hidden = true;
-      replayTabCache.set(tab, pane);
-      box.append(pane);
+    if (tab !== "summary" && !replaySectionsRendered.has(tab)) {
+      replaySectionsRendered.add(tab);
+      const content = replaySectionContents.get(tab);
+      if (content) renderReplayTab(tab, current, content);
     }
-    for (const [name, cachedPane] of replayTabCache)
-      cachedPane.hidden = name !== tab;
-    if (shouldRender) renderReplayTab(tab, current, pane);
+    if (navigate) {
+      if (tab === "events" && eventReturnScrollY !== null) {
+        const returnTo = eventReturnScrollY;
+        eventReturnScrollY = null;
+        window.scrollTo({ top: returnTo, behavior: "smooth" });
+      } else {
+        const target = tab === "summary"
+          ? $("#saveTitle")
+          : replaySections.get(tab);
+        target?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    }
     return;
   }
-  replayTabCacheOwner = null;
-  replayTabCache.clear();
-  const p = current.payload;
+  const sectionsBox = $("#tabSections"),
+    fallbackCard = $("#tabContentCard");
+  fallbackCard.hidden = true;
+  sectionsBox.hidden = false;
+  if (replaySectionsOwner !== current) {
+    replaySectionsOwner = current;
+    replaySections.clear();
+    replaySectionContents.clear();
+    replaySectionsRendered.clear();
+    replayMapNavigator = null;
+    eventReturnScrollY = null;
+    replayBuildGeneration++;
+    sectionsBox.replaceChildren();
+    const titles = { summary: "Summary", players: "Players", metadata: "Metadata", strings: "Strings" };
+    for (const name of Object.keys(titles)) {
+      const button = document.querySelector(`.tabs button[data-tab="${name}"]`);
+      if (!button || button.hidden) continue;
+      const section = document.createElement("section");
+      section.className = "card replay-section save-section";
+      section.id = `save-section-${name}`;
+      section.setAttribute("aria-label", titles[name]);
+      const heading = document.createElement("h2");
+      heading.textContent = titles[name];
+      const content = document.createElement("div");
+      content.className = "raw single-page-raw";
+      section.append(heading, content);
+      sectionsBox.append(section);
+      replaySections.set(name, section);
+      replaySectionContents.set(name, content);
+      replaySectionsRendered.add(name);
+      renderSaveTab(name, current, content);
+    }
+  }
+  if (navigate)
+    replaySections.get(tab)?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+function renderSaveTab(tab, d, box) {
+  const h = d.header, p = d.payload;
   const setLines = (lines) => (box.textContent = lines.join("\n"));
   if (tab === "summary")
     setLines([
-      `File: ${current.file.name}`,
-      `File size: ${current.file.size} bytes`,
+      `File: ${d.file.name}`,
+      `File size: ${d.file.size} bytes`,
       `Save version: ${saveVersionLabel(h.saveVersion)}`,
       `Game build: ${h.gameVersion} (${h.build})`,
       `Game mode: ${gameModeLabel(h.mode)}`,
@@ -1252,9 +1343,10 @@ function renderReplayTab(tab, d, box) {
     const chartPlayers = h.players
       .map((player, index) => ({ player, index }))
       .filter(({ index }) => metrics.some((metric) => metric.byPlayer[index]?.length));
-    box.innerHTML = `${metrics.length ? `<section class="event-chart-card"><div class="event-chart-head"><label class="metric-picker"><select id="eventMetricSelect">${metrics.map((m, i) => `<option value="${i}">${esc(m.key)}</option>`).join("")}</select></label></div><div class="event-chart-layout"><aside class="event-series-panel"><div id="eventSeriesList" class="event-series-list">${chartPlayers.map(renderSeriesOption).join("")}</div></aside><div id="eventChart" class="event-chart"></div></div></section>` : ""}<h3 class="events-heading">Timeline</h3>${replayTable(
-      ["Turn", "Year", "Type", "Civilization", "Location", "Event"],
-      r.events
+    const sortedEvents = [...r.events].sort((a, b) => a.turn - b.turn);
+    box.innerHTML = `${metrics.length ? `<section class="event-chart-card"><div class="event-chart-head"><label class="metric-picker"><select id="eventMetricSelect">${metrics.map((m, i) => `<option value="${i}">${esc(metricLabel(m.key))}</option>`).join("")}</select></label></div><div class="event-chart-layout"><aside class="event-series-panel"><div id="eventSeriesList" class="event-series-list">${chartPlayers.map(renderSeriesOption).join("")}</div></aside><div id="eventChart" class="event-chart"></div></div></section>` : ""}${replayTable(
+      ["Turn", "Year", "Type", "Civilization", "Location", "Event", ""],
+      sortedEvents
         .map((e) => {
           const owner = playerByName.get(e.civ);
           return [
@@ -1264,10 +1356,33 @@ function renderReplayTab(tab, d, box) {
             { trustedHtml: true, value: renderEventCivilization(e.civ, owner) },
             e.x === undefined ? "" : `${e.x}, ${e.y}`,
             { trustedHtml: true, value: renderEventText(e.text) },
+            "",
           ];
-        })
-        .sort((a, b) => a[0] - b[0]),
+        }),
     )}`;
+    box.querySelectorAll(".data-table tbody tr").forEach((row, index) => {
+      const event = sortedEvents[index];
+      if (event.x === undefined || event.y === undefined) return;
+      const button = document.createElement("button");
+      button.className = "event-map-button";
+      button.type = "button";
+      button.title = "Show event on map";
+      button.setAttribute("aria-label", "Show event on map");
+      button.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3.2v9.6L13 8z"/></svg>';
+      row.lastElementChild.replaceChildren(button);
+      button.addEventListener("click", () => {
+        const jump = { turn: event.turn, x: Number(event.x), y: Number(event.y) };
+        eventReturnScrollY = window.scrollY;
+        renderTab("map");
+        requestAnimationFrame(() => {
+          document.querySelector("#mapWorld")?.scrollIntoView({
+            behavior: "smooth",
+            block: "center",
+          });
+          replayMapNavigator?.focus(jump);
+        });
+      });
+    });
     const eventMetricSelect = box.querySelector("#eventMetricSelect"),
       eventChart = box.querySelector("#eventChart"),
       eventSeriesList = box.querySelector("#eventSeriesList");
@@ -1295,7 +1410,39 @@ function renderReplayTab(tab, d, box) {
             const yy = y(value);
             return `<line x1="${pad.left}" x2="${width - pad.right}" y1="${yy}" y2="${yy}" class="chart-gridline"/><text x="${width - pad.right + 9}" y="${yy + 4}" class="chart-axis-label">${Math.round(value).toLocaleString()}</text>`;
           }).join("");
-        eventChart.innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img"><rect class="chart-plot-bg" x="1" y="1" width="${width - 2}" height="${height - 2}"/>${ticks}<line x1="${pad.left}" x2="${width - pad.right}" y1="${height - pad.bottom}" y2="${height - pad.bottom}" class="chart-axis"/><text x="${pad.left}" y="${height - 10}" class="chart-axis-label">${esc(replayYear(h, minTurn))}</text><text x="${width - pad.right}" y="${height - 10}" text-anchor="end" class="chart-axis-label">${esc(replayYear(h, h.endTurn))}</text>${lines}</svg>${visible.length ? "" : '<div class="event-chart-empty">Select a civilization</div>'}`;
+        eventChart.innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img"><rect class="chart-plot-bg" x="1" y="1" width="${width - 2}" height="${height - 2}"/>${ticks}<line x1="${pad.left}" x2="${width - pad.right}" y1="${height - pad.bottom}" y2="${height - pad.bottom}" class="chart-axis"/><text x="${pad.left}" y="${height - 10}" class="chart-axis-label">${esc(replayYear(h, minTurn))}</text><text x="${width - pad.right}" y="${height - 10}" text-anchor="end" class="chart-axis-label">${esc(replayYear(h, maxTurn))}</text>${lines}</svg>${visible.length ? "" : '<div class="event-chart-empty">Select a civilization</div>'}`;
+        const svg = eventChart.querySelector("svg");
+        if (!svg) return;
+        const tip = document.createElement("div");
+        tip.className = "event-chart-tooltip";
+        tip.hidden = true;
+        eventChart.append(tip);
+        const nearestSample = (samples, turn) => {
+          let low = 0, high = samples.length;
+          while (low < high) {
+            const middle = (low + high) >> 1;
+            if (samples[middle].turn < turn) low = middle + 1;
+            else high = middle;
+          }
+          const before = samples[Math.max(0, low - 1)], after = samples[Math.min(samples.length - 1, low)];
+          return !before ? after : !after || turn - before.turn <= after.turn - turn ? before : after;
+        };
+        svg.addEventListener("pointermove", (event) => {
+          const rect = svg.getBoundingClientRect(),
+            plotX = (event.clientX - rect.left) * width / rect.width;
+          if (plotX < pad.left || plotX > width - pad.right || !visible.length) {
+            tip.hidden = true;
+            return;
+          }
+          const turn = Math.round(minTurn + (plotX - pad.left) / (width - pad.left - pad.right) * (maxTurn - minTurn)),
+            rows = visible.map(({ samples, player }) => ({ samples, player, point: nearestSample(samples, turn) })),
+            chartRect = eventChart.getBoundingClientRect();
+          tip.innerHTML = `<b>Turn ${turn} · ${esc(replayYear(h, turn))}</b>${rows.map(({ player, point }) => `<span><i style="--series-color:${seriesColor(h.players[player])}"></i>${esc(playerLabel(h.players[player], player))}: ${point.value.toLocaleString()}</span>`).join("")}`;
+          tip.hidden = false;
+          tip.style.left = `${Math.max(8, Math.min(event.clientX - chartRect.left + 12, eventChart.clientWidth - tip.offsetWidth - 8))}px`;
+          tip.style.top = `${Math.max(8, Math.min(event.clientY - chartRect.top + 12, eventChart.clientHeight - tip.offsetHeight - 8))}px`;
+        });
+        svg.addEventListener("pointerleave", () => { tip.hidden = true; });
       };
       eventMetricSelect.addEventListener("change", drawEventChart);
       eventSeriesList?.querySelectorAll("[data-series-player]").forEach((input) =>
@@ -1327,7 +1474,7 @@ function renderReplayTab(tab, d, box) {
     const usable = metrics.filter((m) => m.rows.length);
     if (!usable.length)
       return text("This replay contains no turn metric samples.");
-    box.innerHTML = `<label class="metric-picker">Metric <select id="metricSelect">${usable.map((m, i) => `<option value="${i}">${esc(m.key)}</option>`).join("")}</select></label><div id="metricRows"></div>`;
+    box.innerHTML = `<label class="metric-picker">Metric <select id="metricSelect">${usable.map((m, i) => `<option value="${i}">${esc(metricLabel(m.key))}</option>`).join("")}</select></label><div id="metricRows"></div>`;
     const select = box.querySelector("#metricSelect"),
       target = box.querySelector("#metricRows");
     const draw = () => {
@@ -1352,7 +1499,16 @@ function renderReplayTab(tab, d, box) {
   }
   if (tab === "map") {
     const mapCard = box.closest(".card"),
-      contentGridWidth = document.querySelector(".content-grid")?.getBoundingClientRect().width || mapCard.clientWidth,
+      contentGrid = document.querySelector(".content-grid"),
+      page = document.querySelector(".page"),
+      pageStyle = page && getComputedStyle(page),
+      pageContentWidth = page
+        ? page.clientWidth -
+          (Number.parseFloat(pageStyle.paddingLeft) || 0) -
+          (Number.parseFloat(pageStyle.paddingRight) || 0)
+        : 0,
+      contentGridWidth =
+        contentGrid?.getBoundingClientRect().width || pageContentWidth || mapCard.clientWidth,
       mapInnerMinWidth = Math.max(1, contentGridWidth - 36),
       radius = Math.max(9, mapInnerMinWidth / (2 + Math.sqrt(3) * r.mapWidth)),
       hexW = Math.sqrt(3) * radius,
@@ -1392,7 +1548,7 @@ function renderReplayTab(tab, d, box) {
       if (localStorage.getItem(opacityKey) !== null && Number.isFinite(stored))
         initialTerritoryOpacity = Math.max(0, Math.min(100, stored));
     } catch {}
-    box.innerHTML = `<div class="map-timeline"><button id="mapPlayToggle" class="map-play-toggle" type="button" title="Play map history"><svg class="play-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg><svg class="pause-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2h4v12H3zm6 0h4v12H9z"/></svg></button><label class="metric-picker">Turn <input id="mapTurn" type="range" min="${h.startTurn}" max="${Math.max(h.startTurn, h.endTurn)}" value="${initialMapTurn}"><b id="mapTurnLabel">${initialMapTurn}</b></label><button id="mapExport" class="map-export-button" type="button">Render video</button><span id="mapExportStatus" role="status" aria-live="polite"></span></div><div class="replay-map-wrap"><div id="mapWorld" class="map-world" style="width:min(${canvasWidth}px,100%);aspect-ratio:${canvasWidth}/${canvasHeight}"><canvas class="map-layer-canvas" data-map-layer="terrain" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="elevation" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="features" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="grid" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="territory" width="${canvasWidth}" height="${canvasHeight}"></div><div id="mapTileTooltip" class="map-tile-tooltip" hidden></div><div class="map-zoom-controls"><button type="button" data-zoom="out">−</button><button type="button" data-zoom="reset">100%</button><button type="button" data-zoom="in">+</button></div></div><div class="map-layer-controls"><span>Layers</span>${[
+    box.innerHTML = `<div class="map-timeline"><button id="mapPlayToggle" class="map-play-toggle" type="button" title="Play map history"><svg class="play-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg><svg class="pause-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2h4v12H3zm6 0h4v12H9z"/></svg></button><label class="metric-picker">Turn <input id="mapTurn" type="range" min="${h.startTurn}" max="${Math.max(h.startTurn, h.endTurn)}" value="${initialMapTurn}"><b id="mapTurnLabel">${initialMapTurn}</b></label><button id="mapExport" class="map-export-button" type="button">Render video</button><span id="mapExportStatus" role="status" aria-live="polite"></span></div><div class="replay-map-wrap"><div id="mapWorld" class="map-world" style="width:max(${canvasWidth}px,100%);aspect-ratio:${canvasWidth}/${canvasHeight}"><canvas class="map-layer-canvas" data-map-layer="terrain" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="elevation" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="features" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="grid" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="territory" width="${canvasWidth}" height="${canvasHeight}"></div><div id="mapTileTooltip" class="map-tile-tooltip" hidden></div><div class="map-zoom-controls"><button type="button" data-zoom="out">−</button><button type="button" data-zoom="reset">100%</button><button type="button" data-zoom="in">+</button></div></div><div class="map-layer-controls"><span>Layers</span>${[
       ["terrain", "Terrain"],
       ["elevation", "Elevation"],
       ["features", "Features"],
@@ -1405,7 +1561,7 @@ function renderReplayTab(tab, d, box) {
       )
       .join(
         "",
-      )}</div><label class="metric-picker map-opacity-control">Territory overlay <input id="territoryOpacity" type="range" min="0" max="100" value="${initialTerritoryOpacity}"><b id="territoryOpacityLabel">${initialTerritoryOpacity}%</b></label><div class="map-legend" style="width:min(${canvasWidth}px,100%);max-width:100%;margin-inline:auto">${terrainLegend.map(([asset, name]) => `<span><i style="background-image:url('assets/terrain/${asset}.png')"></i>${name}</span>`).join("")}${h.players.map((p) => `<span><i style="background:${p.secondaryColor || p.color}"></i>${esc(p.displayCiv || p.shortName)}</span>`).join("")}</div>`;
+      )}</div><label class="metric-picker map-opacity-control">Territory overlay <input id="territoryOpacity" type="range" min="0" max="100" value="${initialTerritoryOpacity}"><b id="territoryOpacityLabel">${initialTerritoryOpacity}%</b></label><div class="map-legend" style="width:max(${canvasWidth}px,100%);max-width:100%;margin-inline:auto">${terrainLegend.map(([asset, name]) => `<span><i style="background-image:url('assets/terrain/${asset}.png')"></i>${name}</span>`).join("")}${h.players.map((p) => `<span><i style="background:${p.secondaryColor || p.color}"></i>${esc(p.displayCiv || p.shortName)}</span>`).join("")}</div>`;
     const world = box.querySelector("#mapWorld"),
       viewport = world.parentElement,
       range = box.querySelector("#mapTurn"),
@@ -1475,10 +1631,11 @@ function renderReplayTab(tab, d, box) {
     let territoryOpacity = Number(opacityRange.value),
       currentOwners = new Map(),
       currentCities = new Map(),
+      focusTileKey = null,
+      focusTimer = 0,
+      focusFrame = 0,
+      focusStartedAt = 0,
       zoom = 1,
-      zoomTarget = 1,
-      zoomAnimation = null,
-      zoomFrame = 0,
       panX = 0,
       panY = 0,
       drag = null,
@@ -1486,71 +1643,73 @@ function renderReplayTab(tab, d, box) {
       pinch = null;
     layers.territory.canvas.style.opacity = String(territoryOpacity / 100);
     const clampPan = () => {
-      const baseX = Math.max(0, (viewport.clientWidth - world.clientWidth) / 2);
-      if (world.clientWidth * zoom <= viewport.clientWidth)
-        panX = (viewport.clientWidth - world.clientWidth * zoom) / 2 - baseX;
+      const baseX = Math.max(0, (viewport.clientWidth - world.clientWidth) / 2),
+        scaledWidth = world.clientWidth * zoom,
+        scaledHeight = world.clientHeight * zoom;
+      if (scaledWidth <= viewport.clientWidth)
+        panX = (viewport.clientWidth - scaledWidth) / 2 - baseX;
       else
-        panX = Math.min(
-          -baseX,
-          Math.max(
-            viewport.clientWidth - world.clientWidth * zoom - baseX,
-            panX,
-          ),
-        );
-      panY = Math.min(
-        0,
-        Math.max(viewport.clientHeight - world.clientHeight * zoom, panY),
-      );
+        panX = Math.max(viewport.clientWidth - baseX - scaledWidth, Math.min(-baseX, panX));
+      if (scaledHeight <= viewport.clientHeight) panY = 0;
+      else panY = Math.max(viewport.clientHeight - scaledHeight, Math.min(0, panY));
     };
     const applyZoom = () => {
       clampPan();
       world.style.transform = `translate(${panX}px,${panY}px) scale(${zoom})`;
       zoomReadout.textContent = `${Math.round(zoom * 100)}%`;
     };
-    const animateZoom = (next, x, y) => {
-      zoomTarget = Math.max(1, Math.min(5, next));
-      const baseX = Math.max(0, (viewport.clientWidth - world.clientWidth) / 2);
-      zoomAnimation = {
-        startZoom: zoom,
-        targetZoom: zoomTarget,
-        startTime: performance.now(),
-        duration: 150,
-        baseX,
-        mapX: (x - baseX - panX) / zoom,
-        mapY: (y - panY) / zoom,
-        x,
-        y,
-      };
-      if (!zoomFrame)
-        zoomFrame = requestAnimationFrame(function tick(now) {
-          const a = zoomAnimation;
-          if (!a) {
-            zoomFrame = 0;
-            return;
-          }
-          const t = Math.min(1, (now - a.startTime) / a.duration),
-            ease = 1 - Math.pow(1 - t, 3);
-          zoom = a.startZoom + (a.targetZoom - a.startZoom) * ease;
-          panX = a.x - a.baseX - a.mapX * zoom;
-          panY = a.y - a.mapY * zoom;
-          applyZoom();
-          if (t < 1) zoomFrame = requestAnimationFrame(tick);
-          else {
-            zoom = a.targetZoom;
-            zoomAnimation = null;
-            zoomFrame = 0;
-            applyZoom();
-          }
-        });
+    const setZoomAt = (nextZoom, x, y, fixedMapX = null, fixedMapY = null) => {
+      const baseX = Math.max(0, (viewport.clientWidth - world.clientWidth) / 2),
+        mapX = fixedMapX ?? (x - baseX - panX) / zoom,
+        mapY = fixedMapY ?? (y - panY) / zoom,
+        next = Math.max(1, Math.min(5, nextZoom));
+      zoom = next;
+      panX = x - baseX - mapX * zoom;
+      panY = y - mapY * zoom;
+      applyZoom();
     };
-    const zoomBy = (factor, x, y) => animateZoom(zoomTarget * factor, x, y);
+    replayMapNavigator = {
+      focus: ({ turn, x, y }) => {
+        range.value = String(Math.max(Number(range.min), Math.min(Number(range.max), turn)));
+        range.dispatchEvent(new Event("input", { bubbles: true }));
+        clearTimeout(focusTimer);
+        cancelAnimationFrame(focusFrame);
+        focusFrame = 0;
+        focusTileKey = null;
+        const tile = territoryTiles[y * r.mapWidth + x];
+        if (!tile) {
+          zoom = 1;
+          panX = panY = 0;
+          applyZoom();
+          tooltip.hidden = true;
+          drawTerritory();
+          return;
+        }
+        focusTileKey = `${x},${y}`;
+        focusStartedAt = performance.now();
+        tooltip.hidden = true;
+        const animateFocus = () => {
+          if (!focusTileKey || !box.contains(world)) return;
+          drawTerritory();
+          focusFrame = requestAnimationFrame(animateFocus);
+        };
+        focusFrame = requestAnimationFrame(animateFocus);
+        focusTimer = setTimeout(() => {
+          focusTileKey = null;
+          cancelAnimationFrame(focusFrame);
+          focusFrame = 0;
+          if (box.contains(world)) drawTerritory();
+        }, 3000);
+        const mapX = tile.cx * world.clientWidth / canvasWidth,
+          mapY = tile.cy * world.clientHeight / canvasHeight;
+        setZoomAt(2, viewport.clientWidth / 2, viewport.clientHeight / 2, mapX, mapY);
+      },
+    };
+    const zoomBy = (factor, x, y) => setZoomAt(zoom * factor, x, y);
     box.querySelectorAll(".map-zoom-controls button").forEach((button) =>
       button.addEventListener("click", () => {
         if (button.dataset.zoom === "reset") {
-          if (zoomFrame) cancelAnimationFrame(zoomFrame);
-          zoomFrame = 0;
-          zoomAnimation = null;
-          zoom = zoomTarget = 1;
+          zoom = 1;
           panX = panY = 0;
           applyZoom();
           return;
@@ -1580,12 +1739,6 @@ function renderReplayTab(tab, d, box) {
     });
     viewport.addEventListener("pointerdown", (event) => {
       if (event.target.closest(".map-zoom-controls")) return;
-      if (zoomFrame) {
-        cancelAnimationFrame(zoomFrame);
-        zoomFrame = 0;
-        zoomAnimation = null;
-        zoomTarget = zoom;
-      }
       viewport.setPointerCapture(event.pointerId);
       const rect = viewport.getBoundingClientRect(),
         point = { x: event.clientX - rect.left, y: event.clientY - rect.top };
@@ -1617,9 +1770,6 @@ function renderReplayTab(tab, d, box) {
         y: event.clientY - rect.top,
       });
       if (pointers.size >= 2 && pinch) {
-        if (zoomFrame) cancelAnimationFrame(zoomFrame);
-        zoomFrame = 0;
-        zoomAnimation = null;
         const pts = [...pointers.values()],
           dx = pts[0].x - pts[1].x,
           dy = pts[0].y - pts[1].y,
@@ -1635,7 +1785,6 @@ function renderReplayTab(tab, d, box) {
             (pinch.zoom * Math.hypot(dx, dy)) / Math.max(1, pinch.distance),
           ),
         );
-        zoomTarget = zoom;
         panX = center.x - baseX - pinch.mapX * zoom;
         panY = center.y - pinch.mapY * zoom;
         applyZoom();
@@ -1735,24 +1884,26 @@ function renderReplayTab(tab, d, box) {
       territoryTiles.forEach(({ key, cx, cy }) => {
         const owner = owners.get(key),
           player = replayPlayers.get(owner);
-        if (!player) return;
+        if (!player && key !== focusTileKey) return;
         traceReplayHex(ctx, cx, cy, radius);
         const city = cities.get(key),
           isCityState =
-            player.civilization === "CIVILIZATION_MINOR" ||
-            (player.civilization || "").startsWith("MINOR_CIV_"),
+            player?.civilization === "CIVILIZATION_MINOR" ||
+            (player?.civilization || "").startsWith("MINOR_CIV_"),
           isMajorCity =
             city &&
             !isCityState &&
             player.civilization !== "CIVILIZATION_BARBARIAN";
-        const cityColor = player.secondaryColor || player.color;
-        ctx.fillStyle = isCityState
-          ? city
-            ? cityColor
-            : replayPalette.unclaimedMinor
-          : isMajorCity
-            ? player.color
-            : cityColor;
+        const cityColor = player?.secondaryColor || player?.color;
+        ctx.fillStyle = !player
+          ? "rgba(255, 205, 54, .5)"
+          : isCityState
+            ? city
+              ? cityColor
+              : replayPalette.unclaimedMinor
+            : isMajorCity
+              ? player.color
+              : cityColor;
         ctx.fill();
       });
       territoryTiles.forEach(({ key, cx, cy, neighbors }) => {
@@ -1794,10 +1945,10 @@ function renderReplayTab(tab, d, box) {
         ) {
           const trait = cityStateTraits[normalizeReplayName(city.owner)],
             traitImage = trait ? cityIcons[trait] : null;
-          if (cityIcons.CIV_CS_ICON)
-            ctx.drawImage(cityIcons.CIV_CS_ICON, cx - 7, cy - 7, 10, 10);
           if (traitImage)
-            ctx.drawImage(traitImage, cx + 1, cy - 4, 7, 7);
+            ctx.drawImage(traitImage, cx - 7, cy - 7, 14, 14);
+          if (cityIcons.CIV_CS_ICON)
+            ctx.drawImage(cityIcons.CIV_CS_ICON, cx + 1, cy + 1, 6, 6);
         } else {
           if (cityIcons.CIV_CITY_ICON) {
             const iconSize = Math.min(hexW, radius * 2);
@@ -1825,6 +1976,27 @@ function renderReplayTab(tab, d, box) {
             ctx.fillRect(cx - 2, cy - 1.5, 4, 4);
             ctx.fillRect(cx - 3.5, cy + 1, 7, 1.5);
           }
+        }
+      }
+      if (focusTileKey) {
+        const [focusX, focusY] = focusTileKey.split(",").map(Number),
+          focusTile = territoryTiles[focusY * r.mapWidth + focusX];
+        if (focusTile) {
+          const elapsed = performance.now() - focusStartedAt,
+            progress = Math.min(1, elapsed / 3000),
+            envelope = Math.sin(Math.PI * progress),
+            pulse = (Math.sin(elapsed / 170) + 1) / 2;
+          ctx.save();
+          traceReplayHex(ctx, focusTile.cx, focusTile.cy, radius);
+          ctx.shadowColor = `rgba(255, 205, 82, ${(0.7 + pulse * 0.3) * envelope})`;
+          ctx.shadowBlur = radius * (1.5 + pulse * 1.5) * envelope;
+          ctx.fillStyle = `rgba(255, 205, 82, ${(0.2 + pulse * 0.2) * envelope})`;
+          ctx.fill();
+          ctx.shadowBlur = 0;
+          ctx.lineWidth = 1.25 + pulse * 0.75;
+          ctx.strokeStyle = `rgba(255, 242, 195, ${(0.75 + pulse * 0.25) * envelope})`;
+          ctx.stroke();
+          ctx.restore();
         }
       }
       box.querySelector("#mapTurnLabel").textContent = turn;
@@ -2283,4 +2455,4 @@ function replayFeatureLabel(id) {
 }
 document
   .querySelectorAll(".tabs button")
-  .forEach((b) => b.addEventListener("click", () => renderTab(b.dataset.tab)));
+  .forEach((b) => b.addEventListener("click", () => renderTab(b.dataset.tab, { navigate: true })));

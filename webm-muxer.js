@@ -80,8 +80,28 @@
             clusterSize = timecodeElement.length + block.size;
           return new Blob([id("1f43b675"), sizeVint(clusterSize), timecodeElement, block]);
         }),
-        segmentHeader = join(id("18538067"), Uint8Array.of(1, 255, 255, 255, 255, 255, 255, 255)),
-        parts = [ebml, segmentHeader, info, tracks, ...clusters];
+        clusterBytes = clusters.reduce((sum, cluster) => sum + cluster.size, 0);
+      let seekHead = new Uint8Array(), cues;
+      while (true) {
+        let clusterPosition = seekHead.length + info.length + tracks.length;
+        cues = element("1c53bb6b", ...this.frames.flatMap((frame, index) => {
+          const position = clusterPosition;
+          clusterPosition += clusters[index].size;
+          return frame.keyframe
+            ? [element("bb", element("b3", uint(Math.max(0, Math.round(frame.timestamp / 1000)))), element("b7", element("f7", uint(1)), element("f1", uint(position))))]
+            : [];
+        }));
+        const cuePosition = seekHead.length + info.length + tracks.length + clusterBytes,
+          nextSeekHead = element("114d9b74", element("4dbb", element("53ab", id("1c53bb6b")), element("53ac", uint(cuePosition))));
+        if (nextSeekHead.length === seekHead.length) {
+          seekHead = nextSeekHead;
+          break;
+        }
+        seekHead = nextSeekHead;
+      }
+      const segmentSize = seekHead.length + info.length + tracks.length + clusterBytes + cues.length,
+        segmentHeader = join(id("18538067"), sizeVint(segmentSize)),
+        parts = [ebml, segmentHeader, seekHead, info, tracks, ...clusters, cues];
       return new Blob(parts, { type: "video/webm" });
     }
   }

@@ -56,15 +56,16 @@
         </div>
         <nav class="tabs">
           <button class="active" data-tab="summary">Summary</button>
-          <button data-tab="history">Turn history</button>
-          <button data-tab="events">Events</button>
           <button data-tab="map">Map history</button>
+          <button data-tab="events">Events</button>
+          <button data-tab="history">Turn history</button>
           <button data-tab="units">Units</button>
           <button data-tab="players">Players</button>
           <button data-tab="metadata">Metadata</button>
           <button data-tab="strings">Strings</button>
         </nav>
-        <section class="card"><div id="tabContent" class="raw"></div></section>
+        <div id="tabSections"></div>
+        <section id="tabContentCard" class="card"><div id="tabContent" class="raw"></div></section>
       </section>
     </main>
     <script src="./assets/civ5-colors.js"></script>
