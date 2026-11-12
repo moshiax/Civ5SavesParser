@@ -1,4 +1,10 @@
 "use strict";
+import {
+  parseSave,
+  saveFeatureName,
+  saveImprovementName,
+  saveResourceName,
+} from "./save-parser.mjs";
 function showNotification(message) {
   const notification = document.getElementById("notification");
   notification.querySelector("p").innerText = message;
@@ -9,8 +15,7 @@ function showNotification(message) {
     setTimeout(() => { notification.style.display = "none"; }, 500);
   }, 2300);
 }
-const playerColors = window.CIV5_PLAYER_COLORS || {};
-const civilizationColors = window.CIV5_REPLAY_CIV_COLORS || {};
+const colorTable = window.CIV5_COLORS || {};
 const replayCivAssets = window.CIV5_REPLAY_CIV_ASSETS || [];
 const normalizeReplayName = (value) =>
   String(value || "")
@@ -25,6 +30,24 @@ const cityStateTraits = Object.fromEntries(
   ]),
 );
 const $ = (s) => document.querySelector(s);
+const DEBUG_STORAGE_KEY = "civ5-parser-debug";
+let debugEnabled = false;
+try { debugEnabled = localStorage.getItem(DEBUG_STORAGE_KEY) === "true"; } catch {}
+const debugToggle = $("#debugToggle");
+debugToggle.addEventListener("click", () => setDebugEnabled(!debugEnabled));
+function setDebugEnabled(enabled, logChange = true) {
+  debugEnabled = Boolean(enabled);
+  try { localStorage.setItem(DEBUG_STORAGE_KEY, String(debugEnabled)); } catch {}
+  debugToggle.setAttribute("aria-pressed", String(debugEnabled));
+  debugToggle.classList.toggle("is-enabled", debugEnabled);
+  debugToggle.title = `Debug logs ${debugEnabled ? "enabled" : "disabled"}`;
+  if (logChange) console.info(`[Civ5] Debug logs ${debugEnabled ? "enabled" : "disabled"}`);
+}
+setDebugEnabled(debugEnabled, false);
+window.Civ5ParserDebug = {
+  get enabled() { return debugEnabled; },
+  setEnabled: setDebugEnabled,
+};
 const metricLabel = (key) => key.replace(/^(?:REPLAYDATASET|INFOADDICTDATASET)_/, "");
 const cssColor = (name) =>
   getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -33,7 +56,6 @@ const replayPalette = {
   playerSecondary: cssColor("--color-player-secondary-default"),
   playerSecondaryNeutral: cssColor("--color-player-secondary-neutral"),
   replayFallback: cssColor("--color-replay-fallback"),
-  unclaimedMinor: cssColor("--map-citystate-unclaimed"),
   cityMarker: cssColor("--map-city-marker"),
   cityMarkerStroke: cssColor("--map-city-marker-stroke"),
   cityMarkerDetail: cssColor("--map-city-marker-detail"),
@@ -48,6 +70,9 @@ const replayPalette = {
   ].map(cssColor),
   terrainFallback: cssColor("--terrain-color-fallback"),
 };
+const replayFeaturesRenderedSeparately = ["ICE", "JUNGLE", "FOREST", "FLOOD_PLAINS", "FALLOUT"];
+const replayYieldNames = ["Food", "Production", "Gold", "Science", "Culture", "Faith"];
+const replayYieldIcons = ["ICON_FOOD", "ICON_PRODUCTION", "ICON_GOLD", "ICON_RESEARCH", "ICON_CULTURE", "ICON_FAITH"];
 const drop = $("#dropzone"),
   input = $("#fileInput");
 let current = null,
@@ -59,7 +84,33 @@ const replaySectionsRendered = new Set();
 let replayBuildGeneration = 0;
 let eventReturnScrollY = null;
 let replayMapNavigator = null;
+let redrawSaveMapInPlace = null;
 let dragDepth = 0;
+let showRecoveredMapTiles = false;
+function saveMapForDisplay(map, showRecovered) {
+  if (!map || showRecovered) return map;
+  const firstRecovered = map.tiles.findIndex((tile) => tile.recovered);
+  if (firstRecovered < 0) return map;
+  const cities = new Set();
+  let parsedTiles = 0, units = 0;
+  const tiles = map.tiles.map((tile, index) => {
+    if (index >= firstRecovered) return {
+      x: tile.x, y: tile.y, typeId: 6, plotTypeId: 3, units: [], dataUnavailable: true,
+    };
+    if (!tile.dataUnavailable) parsedTiles++;
+    units += tile.units?.length || 0;
+    if (tile.plotCity?.owner >= 0 && tile.plotCity?.id >= 0)
+      cities.add(`${tile.plotCity.owner}:${tile.plotCity.id}`);
+    return tile;
+  });
+  return {
+    ...map,
+    tiles,
+    parsedTiles,
+    complete: false,
+    entities: {units, cities: cities.size},
+  };
+}
 const themeToggle = $("#themeToggle"),
   themePreference = window.matchMedia?.("(prefers-color-scheme: dark)");
 const readThemeChoice = () => {
@@ -149,6 +200,207 @@ function gameEnumLabel(value, prefix) {
     .toLowerCase()
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
+function civilizationDisplayName(player, fallbackIndex = -1) {
+  const civilization = String(player?.civilization || "");
+  if (civilization === "CIVILIZATION_BARBARIAN" || fallbackIndex === 63)
+    return "BARBARIANS";
+  if (civilization.startsWith("CIVILIZATION_") && civilization !== "CIVILIZATION_MINOR")
+    return gameEnumLabel(civilization, "CIVILIZATION_");
+  if (civilization.startsWith("MINOR_CIV_"))
+    return displayCityStateName(civilization.slice("MINOR_CIV_".length));
+  const named = player?.displayCiv || player?.shortName || player?.name;
+  if (named) return civilization === "CIVILIZATION_MINOR" ? displayCityStateName(named) : String(named);
+  if (civilization === "CIVILIZATION_MINOR") return "MINOR CIVILIZATION";
+  return fallbackIndex >= 0 ? `PLAYER ${fallbackIndex + 1}` : "UNKNOWN CIVILIZATION";
+}
+function displayCityStateName(value) {
+  const name = String(value || "").replace(/_CITY$/i, "").replaceAll("_", " ");
+  return name === name.toLocaleUpperCase()
+    ? name.toLocaleLowerCase().replace(/(^|[\s-])\p{L}/gu, (letter) => letter.toLocaleUpperCase())
+    : name;
+}
+function cityStateName(value, fallback = "Minor civilization") {
+  const name = typeof value === "string"
+    ? value
+    : value?.displayCiv || value?.shortName || value?.name;
+  return displayCityStateName(name || fallback);
+}
+function replayTeamDisplayName(teamId, playersByTeam) {
+  if (teamId === 21) return "Observer";
+  if (teamId === 63) return "BARBARIANS";
+  const players = playersByTeam.get(teamId) || [];
+  return players.length
+    ? [...new Set(players.map((player) => civilizationDisplayName(player, player.slot)))].join(" / ")
+    : `Team ${teamId + 1}`;
+}
+function orderVisibilityTeamIds(teamIds) {
+  const rank = (id) => id === 21 ? 2 : id === 63 ? 1 : 0;
+  return teamIds.sort((a, b) => rank(a) - rank(b) || a - b);
+}
+function unitDisplayName(unit, playerName) {
+  const type = unit.type?.replace(/^UNIT_/, "").replaceAll("_", " ") || `Unknown unit type · ID ${unit.id}`,
+    owner = Number.isInteger(unit.owner) && unit.owner >= 0 ? playerName(unit.owner) : "";
+  return owner ? `${type} · ${owner}` : type;
+}
+function logSaveUnitDiagnostics(data) {
+  if (!debugEnabled) return;
+  const map = data.saveMap;
+  if (!map) return;
+  const references = map.tiles.flatMap((tile) => tile.units.map((unit) => ({
+    tile: `${tile.x + 1}, ${tile.y + 1}`,
+    owner: unit.owner,
+    id: unit.id,
+    type: unit.type || "UNKNOWN",
+    recordOffset: map.units.find((record) => record.owner === unit.owner && record.id === unit.id)?.offset ?? null,
+  })));
+  console.groupCollapsed(`[Civ5] Unit parse · ${data.file.name} · ${references.filter((unit) => unit.type !== "UNKNOWN").length}/${references.length} mapped`);
+  console.info("Save", {turn: data.header.turn, build: data.header.build, map: `${map.mapWidth}×${map.mapHeight}`});
+  console.table(references);
+  console.table((map.unitArrayScan?.candidates || []).map((candidate) => ({
+    offset: candidate.offset,
+    recordStart: candidate.recordStart,
+    slots: candidate.slots,
+    count: candidate.count,
+    firstVersion: candidate.firstVersion,
+    firstRecordWords: candidate.firstWords?.slice(0, 8).join(", "),
+    nearbyTypes: candidate.nearbyTypeHashes?.map(({type}) => type).join(", "),
+  })));
+  console.groupEnd();
+}
+function renderReplayProgress(file, state, update) {
+  if (update.type === "header") {
+    state.header = update.header;
+    state.file = file;
+    state.firstEvents = [];
+    state.previewedEvents = 0;
+    state.eventCount = 0;
+    state.metrics = null;
+    state.map = null;
+    const h = state.header;
+    current = {kind: "replay", file, header: h, replay: {mapWidth: 0, mapHeight: 0, tiles: [], events: [], metrics: []}};
+    prepareProgressView();
+    $("#saveTitle").textContent = gameEnumLabel(h.playerCiv, "CIVILIZATION_") || h.players[0]?.name || "Civ V replay";
+    $("#savePath").textContent = file.name;
+    $("#turn").textContent = h.endTurn;
+    $("#dimensions").textContent = "Reading map…";
+    $("#playtime").textContent = `${h.startYear} → ${h.endYear}`;
+    $("#payloadSize").textContent = humanBytes(file.size);
+    renderFacts([["Replay version", h.version], ["Build", h.build], ["Turn range", `${h.startTurn}–${h.endTurn}`], ["Players", h.players.length]]);
+    renderLobbyOptions([]);
+    $("#dlcRecords").hidden = true;
+    drawPlayers(h.players.map((player, index) => ({...player, slot: index})));
+    $("#tabContent").innerHTML = '<div class="replay-progress"><h2>Replay sections</h2><p>Header and players ready</p><p data-progress="metrics">Waiting for metrics…</p><p data-progress="events">Waiting for events…</p><p data-progress="map">Waiting for map…</p><ol data-progress="event-preview"></ol></div>';
+  } else if (update.type === "metrics") {
+    state.metrics = update.metrics;
+    const samples = update.metrics.reduce((sum, metric) => sum + metric.byPlayer.reduce((n, player) => n + player.length, 0), 0);
+    const line = $("[data-progress='metrics']");
+    if (line) line.textContent = `${update.metrics.length} metrics ready · ${samples.toLocaleString()} samples`;
+  } else if (update.type === "events") {
+    state.eventCount = update.count;
+    for (const event of update.items) if (state.firstEvents.length < 12) state.firstEvents.push(event);
+    const line = $("[data-progress='events']");
+    if (line) line.textContent = `${state.eventCount.toLocaleString()} events parsed`;
+    const list = $("[data-progress='event-preview']");
+    if (list && state.firstEvents.length > state.previewedEvents) {
+      list.insertAdjacentHTML("beforeend", state.firstEvents.slice(state.previewedEvents).map((event) => `<li>${esc(event.text || `Event ${event.typeId} · turn ${event.turn}`)}</li>`).join(""));
+      state.previewedEvents = state.firstEvents.length;
+    }
+  } else if (update.type === "map-start") {
+    state.map = {width: update.mapWidth, height: update.mapHeight, tiles: 0, total: update.mapWidth * update.mapHeight};
+    $("#dimensions").textContent = `${update.mapWidth} × ${update.mapHeight}`;
+    const line = $("[data-progress='map']");
+    if (line) line.textContent = `Map ${update.mapWidth} × ${update.mapHeight} · reading tiles…`;
+    const canvas = document.createElement("canvas");
+    canvas.className = "replay-progress-map";
+    canvas.width = update.mapWidth;
+    canvas.height = update.mapHeight;
+    canvas.setAttribute("aria-label", "Map preview loading tile by tile");
+    $("#tabContent .replay-progress")?.append(canvas);
+    state.map.context = canvas.getContext("2d", {alpha: false});
+  } else if (update.type === "map-tiles" && state.map) {
+    state.map.tiles = update.count;
+    const ctx = state.map.context;
+    paintProgressTiles(ctx, update.items, update.start, state.map.width, state.map.height);
+    const line = $("[data-progress='map']");
+    if (line) line.textContent = `Map tiles ${update.count.toLocaleString()} / ${update.total.toLocaleString()}`;
+  }
+}
+function renderSaveProgress(file, state, update) {
+  if (update.type === "header") {
+    state.header = update.header;
+    current = {kind: "save", file, header: {...update.header, players: []}, payload: {bytes: file.size}};
+    prepareProgressView();
+    $("#saveTitle").textContent = gameEnumLabel(update.header.civ, "CIVILIZATION_") || "Civ V save";
+    $("#savePath").textContent = file.name;
+    $("#turn").textContent = update.header.turn;
+    $("#dimensions").textContent = update.header.worldSize.replace(/^WORLDSIZE_/, "");
+    $("#playtime").textContent = "Reading save data…";
+    $("#payloadSize").textContent = humanBytes(file.size);
+    renderFacts([["Save version", update.header.saveVersion], ["Game version", update.header.gameVersion], ["Build", update.header.build], ["Turn", update.header.turn], ["Civilization", gameEnumLabel(update.header.civ, "CIVILIZATION_")], ["World size", update.header.worldSize]]);
+    renderLobbyOptions([]);
+    $("#dlcRecords").hidden = true;
+    $("#tabContent").innerHTML = '<div class="replay-progress"><h2>Save sections</h2><p>Header ready · reading map blocks…</p><p data-progress="save-map">Waiting for map…</p><p data-progress="save-entities">Waiting for units and cities…</p><canvas class="replay-progress-map" data-progress-map></canvas></div>';
+  } else if (update.type === "map-start") {
+    state.map = {width: update.mapWidth, height: update.mapHeight, count: 0, total: update.mapWidth * update.mapHeight};
+    $("#dimensions").textContent = `${update.mapWidth} × ${update.mapHeight}`;
+    const canvas = $("[data-progress-map]");
+    if (canvas) {
+      canvas.width = update.mapWidth;
+      canvas.height = update.mapHeight;
+      state.map.context = canvas.getContext("2d", {alpha: false});
+    }
+    const line = $("[data-progress='save-map']");
+    if (line) line.textContent = `Map ${update.mapWidth} × ${update.mapHeight} · parsing tiles…`;
+  } else if (update.type === "map-tiles" && state.map) {
+    state.map.count = update.start + update.tiles.length;
+    const ctx = state.map.context;
+    paintProgressTiles(ctx, update.tiles, update.start, state.map.width, state.map.height);
+    const line = $("[data-progress='save-map']");
+    if (line) line.textContent = `Map tiles ${state.map.count.toLocaleString()} / ${state.map.total.toLocaleString()}`;
+  } else if (update.type === "players") {
+    current.header.players = update.players;
+    drawPlayers(update.players);
+  } else if (update.type === "entities") {
+    const line = $("[data-progress='save-entities']");
+    if (line) line.textContent = `Entities ready · ${update.units} units · ${update.cities} cities`;
+  }
+}
+function prepareProgressView() {
+  $("#result").hidden = false;
+  $("#tabSections").hidden = true;
+  $("#tabContentCard").hidden = false;
+  setAvailableTabs(["summary"]);
+  document.querySelectorAll(".tabs button").forEach((button) =>
+    button.classList.toggle("active", button.dataset.tab === "summary"),
+  );
+}
+function paintProgressTiles(context, tiles, start, width, height) {
+  if (!context) return;
+  tiles.forEach((tile, offset) => {
+    const index = start + offset;
+    context.fillStyle = terrainColor(tile.typeId);
+    context.fillRect(index % width, height - 1 - Math.floor(index / width), 1, 1);
+  });
+}
+function saveCityDisplayName(value) {
+  const raw = String(value || "");
+  let name = raw.replace(/^TXT_KEY_/, ""), marker = name.lastIndexOf("_CITY_NAME_");
+  if (marker >= 0) name = name.slice(marker + "_CITY_NAME_".length);
+  else if (name.startsWith("CITY_NAME_")) name = name.slice("CITY_NAME_".length);
+  else if (name.startsWith("CITYSTATE_")) name = name.slice("CITYSTATE_".length);
+  if (name !== raw.replace(/^TXT_KEY_/, ""))
+    return name.split("_").filter(Boolean).map((word) => word[0].toUpperCase() + word.slice(1).toLowerCase()).join(" ");
+  return raw;
+}
+function yieldReplayTask() {
+  if (typeof globalThis.scheduler?.yield === "function") return globalThis.scheduler.yield();
+  if (typeof MessageChannel !== "undefined") return new Promise((resolve) => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => { channel.port1.close(); channel.port2.close(); resolve(); };
+    channel.port2.postMessage(0);
+  });
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
 function civHue(value) {
   let hash = 0;
   for (const c of value) hash = (hash * 31 + c.charCodeAt(0)) | 0;
@@ -220,9 +472,24 @@ async function inspect(file) {
   try {
     await new Promise((resolve) => setTimeout(resolve, 30));
     const bytes = new Uint8Array(await file.arrayBuffer());
-    const data = isReplay
-      ? parseReplay(bytes, file.name)
-      : await parseSave(bytes, file.name);
+    const onProgress = createProgressHandler(file, isReplay ? "Replay" : "Parse");
+    let data;
+    if (isReplay) {
+      const replayProgress = {};
+      data = await parseReplay(bytes, file.name, {
+        onSection: (update) => renderReplayProgress(file, replayProgress, update),
+        onProgress,
+      });
+    } else {
+      const saveProgress = {};
+      data = await parseSave(bytes, file.name, {
+          recoverMap: true,
+          diagnostics: debugEnabled,
+          onSection: (update) => renderSaveProgress(file, saveProgress, update),
+          onProgress,
+      });
+    }
+    if (!isReplay) logSaveUnitDiagnostics(data);
     current = data;
     render(data);
     $("#result").hidden = false;
@@ -232,248 +499,21 @@ async function inspect(file) {
     setStatus(e.message || "Save decode failed.", true);
   }
 }
+function createProgressHandler(file, label) {
+  let previousProgressAt = performance.now();
+  return ({phase, percent}) => {
+    const message = `${phase} · ${percent}%`;
+    if (debugEnabled) {
+      const now = performance.now();
+      console.debug(`[Civ5] ${label} ${phase}: ${percent}% (+${Math.round(now - previousProgressAt)} ms)`);
+      previousProgressAt = now;
+    }
+    setStatus(message);
+    $("#dropHint").textContent = `${humanBytes(file.size)} · ${message}`;
+  };
+}
 
-async function parseSave(bytes, filename) {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  if (
-    bytes.length < 64 ||
-    String.fromCharCode(...bytes.subarray(0, 4)) !== "CIV5"
-  )
-    throw new Error("Invalid Civ5 save signature.");
-  let p = 4;
-  const u32 = () => {
-    if (p + 4 > bytes.length) throw new Error("Truncated save header.");
-    const n = view.getUint32(p, true);
-    p += 4;
-    return n;
-  };
-  const i32 = () => {
-    if (p + 4 > bytes.length) throw new Error("Truncated save header.");
-    const n = view.getInt32(p, true);
-    p += 4;
-    return n;
-  };
-  const decoder = new TextDecoder("utf-8");
-  const str = () => {
-    const n = u32();
-    if (n > 1048576 || p + n > bytes.length)
-      throw new Error("Invalid string length in save header.");
-    const s = decoder.decode(bytes.subarray(p, p + n));
-    p += n;
-    return s;
-  };
-  const saveVersion = u32();
-  let gameVersion = "",
-    build = "";
-  if (saveVersion >= 7) {
-    gameVersion = str();
-    build = str();
-  }
-  const turn = i32(),
-    mode = bytes[p++],
-    civ = str(),
-    difficulty = str(),
-    startingEra = str(),
-    era = str(),
-    speed = str(),
-    worldSize = str(),
-    mapScript = str();
-  const delimiterOffsets = [];
-  let cursor = p;
-  while (cursor + 4 <= bytes.length && delimiterOffsets.length < 40) {
-    if (
-      bytes[cursor] === 64 &&
-      bytes[cursor + 1] === 0 &&
-      bytes[cursor + 2] === 0 &&
-      bytes[cursor + 3] === 0
-    ) {
-      delimiterOffsets.push(cursor);
-      cursor += 4;
-    } else cursor++;
-  }
-  const candidates = [];
-  for (const magic of [
-    [1, 0, 120, 156],
-    [120, 156],
-    [120, 218],
-  ])
-    for (let at = p; at < bytes.length - 4;) {
-      at = indexOfBytes(bytes, magic, at);
-      if (at < 0) break;
-      candidates.push(at + (magic.length === 4 ? 2 : 0));
-      at++;
-    }
-  for (let at = p; at + 1 < bytes.length; at++) {
-    const cmf = bytes[at],
-      flg = bytes[at + 1];
-    if ((cmf & 15) === 8 && cmf >> 4 <= 7 && ((cmf << 8) | flg) % 31 === 0)
-      candidates.push(at);
-  }
-  candidates.sort((a, b) => a - b);
-  let z = -1,
-    payload = null,
-    lastError = "";
-  for (const at of [...new Set(candidates)])
-    try {
-      const result = await inflateSyncFlushInBrowser(bytes.subarray(at + 2));
-      if (result.length > 1048576) {
-        z = at;
-        payload = result;
-        break;
-      }
-    } catch (e) {
-      lastError = e.message;
-    }
-  if (!payload)
-    throw new Error(
-      `Compressed game payload not found or invalid: ${lastError || "no full-sized data stream"}`,
-    );
-  const sections = [];
-  for (let i = 0; i <= delimiterOffsets.length; i++) {
-    const start = i === 0 ? 0 : delimiterOffsets[i - 1] + 4,
-      end = i < delimiterOffsets.length ? delimiterOffsets[i] : z;
-    if (end >= start) sections.push(bytes.subarray(start, end));
-  }
-  const getStrings = (index) => {
-    const section = sections[index - 1];
-    if (!section || section.length < 4) return [];
-    const v = new DataView(
-      section.buffer,
-      section.byteOffset,
-      section.byteLength,
-    );
-    let at = 0;
-    const out = [];
-    while (at + 4 <= section.length && out.length < 100) {
-      const n = v.getUint32(at, true);
-      at += 4;
-      if (n > 65536 || at + n > section.length || !n) break;
-      out.push(decoder.decode(section.subarray(at, at + n)));
-      at += n;
-    }
-    return out;
-  };
-  const statusSection = sections[3],
-    statuses = [];
-  if (statusSection && statusSection.length >= 256) {
-    const v = new DataView(
-      statusSection.buffer,
-      statusSection.byteOffset,
-      statusSection.byteLength,
-    );
-    for (let i = 0; i < 64; i++) statuses.push(v.getInt32(i * 4, true));
-  }
-  const playerCivs = getStrings(8),
-    playerLeaders = getStrings(9),
-    playerNames = getStrings(23),
-    playerColors = getStrings(25);
-  const players = statuses
-    .map((status, i) => ({
-      slot: i,
-      status,
-      civilization: playerCivs[i] || "",
-      leader: playerLeaders[i] || "",
-      name: playerNames[i] || "",
-      color: playerColors[i] || "",
-    }))
-    .filter((x) => x.status > 0 && x.status < 4 && x.civilization);
-  const lobbyOptions = extractLobbyOptions(sections[29]);
-  const cityStates = extractCityStates(payload);
-  const text = new TextDecoder("latin1").decode(payload),
-    strings = new Set();
-  for (const m of text.matchAll(/[A-Za-z][A-Za-z0-9_ .'-]{3,80}/g)) {
-    const value = m[0].replace(/[\0-\x1f\x7f-\xff]+/g, "").trim();
-    if (value.length >= 4 && /[A-Za-z]/.test(value)) strings.add(value);
-  }
-  const tokens = [...new Set(text.match(/[A-Z][A-Z0-9_]{3,64}/g) || [])];
-  const playedSeconds =
-    payload.length >= 36
-      ? (new DataView(
-          payload.buffer,
-          payload.byteOffset,
-          payload.byteLength,
-        ).getUint32(32, true) /
-          10) |
-        0
-      : 0;
-  return {
-    file: { name: filename, size: bytes.length },
-    header: {
-      saveVersion,
-      gameVersion,
-      build,
-      turn,
-      mode,
-      civ,
-      difficulty,
-      startingEra,
-      era,
-      speed,
-      worldSize,
-      mapScript,
-      headerBytes: p,
-      compressedOffset: z,
-      sectionCount: delimiterOffsets.length,
-      lobbyOptions,
-      cityStates,
-      players,
-    },
-    payload: {
-      bytes: payload.length,
-      playedSeconds,
-      strings: [...strings].slice(0, 500),
-      tokens: tokens.slice(0, 5000),
-    },
-  };
-}
-function extractLobbyOptions(section) {
-  if (!section) return [];
-  const decoder = new TextDecoder("utf-8"),
-    found = new Map();
-  const pattern = /GAMEOPTION_[A-Z0-9_]+/g;
-  for (const match of decoder.decode(section).matchAll(pattern)) {
-    const byteIndex = new TextEncoder().encode(
-      decoder.decode(section).slice(0, match.index),
-    ).length;
-    if (byteIndex < 4) continue;
-    const view = new DataView(
-      section.buffer,
-      section.byteOffset,
-      section.byteLength,
-    );
-    const keyLength = view.getUint32(byteIndex - 4, true),
-      valueAt = byteIndex + match[0].length;
-    if (keyLength !== match[0].length || valueAt + 4 > section.length) continue;
-    const raw = view.getInt32(valueAt, true);
-    if (raw === 0 || raw === 1) found.set(match[0], Boolean(raw));
-  }
-  return [...found].map(([key, enabled]) => ({ key, enabled }));
-}
-function extractCityStates(payload) {
-  if (!payload) return null;
-  const view = new DataView(
-    payload.buffer,
-    payload.byteOffset,
-    payload.byteLength,
-  );
-  const raw = new TextDecoder("latin1").decode(payload),
-    found = new Map();
-  for (const match of raw.matchAll(/TXT_KEY_CITYSTATE_([A-Z0-9_]+)/g)) {
-    const start = match.index;
-    if (match[1].endsWith("_ADJ") || match[1].endsWith("_DESC")) continue;
-    const lengthPrefixed =
-      start >= 4 && view.getUint32(start - 4, true) === match[0].length;
-    const entry = found.get(match[1]) || { count: 0, lengthPrefixed: false };
-    entry.count++;
-    entry.lengthPrefixed ||= lengthPrefixed;
-    found.set(match[1], entry);
-  }
-  // Some save payload records repeat valid city-state keys without the usual length prefix.
-  return [...found]
-    .filter(([, entry]) => entry.lengthPrefixed || entry.count > 1)
-    .map(([key]) => key);
-}
-function parseReplay(bytes, filename) {
+async function parseReplay(bytes, filename, {onProgress, onSection} = {}) {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let at = 0;
   const need = (n) => {
@@ -514,8 +554,27 @@ function parseReplay(bytes, filename) {
     if (n < 0 || n > max) throw new Error("Invalid " + label + " count: " + n);
     return n;
   };
-  const array = (label, fn, max) =>
-    Array.from({ length: count(label, max) }, (_, i) => fn(i));
+  let nextReplayYieldAt = performance.now() + 8;
+  const array = async (label, fn, max) => {
+    const length = count(label, max), values = new Array(length);
+    const batchSize = label === "event" ? 8192 : 4096;
+    let batchStart = 0;
+    for (let i = 0; i < length; i++) {
+      const value = fn(i);
+      values[i] = value instanceof Promise ? await value : value;
+      if ((i + 1) % batchSize === 0 || i + 1 === length) {
+        if (label === "event") onSection?.({type: "events", items: values.slice(batchStart, i + 1), count: i + 1});
+        if (label === "map tile") onSection?.({type: "map-tiles", items: values.slice(batchStart, i + 1), start: batchStart, count: i + 1, total: length});
+        batchStart = i + 1;
+        onProgress?.({phase: `Reading ${label}`, percent: Math.min(99, 5 + Math.floor(94 * at / bytes.length))});
+        if (label === "event" || label === "map tile" || performance.now() >= nextReplayYieldAt) {
+          await yieldReplayTask();
+          nextReplayYieldAt = performance.now() + 8;
+        }
+      }
+    }
+    return values;
+  };
   if (str(4) !== "CIV5") throw new Error("Invalid Civ5Replay signature.");
   const format = i32(),
     version = varstr(),
@@ -529,7 +588,7 @@ function parseReplay(bytes, filename) {
     gameSpeed = varstr(),
     worldSize = varstr(),
     mapScript = varstr();
-  const dlc = array(
+  const dlc = await array(
     "DLC",
     () => {
       need(16);
@@ -541,7 +600,7 @@ function parseReplay(bytes, filename) {
     },
     1000,
   );
-  const mods = array(
+  const mods = await array(
     "mod",
     () => ({ id: varstr(), version: i32(), name: varstr() }),
     1000,
@@ -562,7 +621,7 @@ function parseReplay(bytes, filename) {
     endYear = varstr();
   i32();
   i32();
-  const civs = array(
+  const civs = await array(
     "civilization",
     () => {
       const raw = [i32(), i32(), i32(), i32()];
@@ -578,17 +637,18 @@ function parseReplay(bytes, filename) {
   );
   const players = civs.map((c, slot) => {
     const asset = replayCivAssets[c.raw[0]],
-      civilization =
-        c.raw[0] === 18
+      civilization = asset?.civilization ||
+        (c.raw[0] === 18
           ? "CIVILIZATION_MINOR"
           : c.raw[0] === 19
             ? "CIVILIZATION_BARBARIAN"
-            : "";
+            : "");
     const displayCiv =
       c.name ||
       c.longName ||
       (civilization === "CIVILIZATION_MINOR" ? "Minor civilization" : "");
-    const color = asset || playerColors[String(c.raw[2])] || [];
+    const [primaryColor, secondaryColor] =
+      colorTable[asset?.civilization] || colorTable[String(c.raw[2])] || [];
     return {
       slot,
       civilization,
@@ -597,41 +657,56 @@ function parseReplay(bytes, filename) {
       name: c.longName,
       shortName: c.name,
       demonym: c.demonym,
-      color: color.color || color[0] || replayPalette.player,
-      secondaryColor: color.secondaryColor || color[1] || replayPalette.playerSecondary,
+      color: primaryColor || replayPalette.player,
+      secondaryColor: secondaryColor || replayPalette.playerSecondary,
       iconKey: asset?.icon || "",
       iconAvailable: Boolean(asset),
       raw: c.raw,
     };
   });
-  const datasetKeys = array("dataset", () => varstr(), 1000);
-  const datasetValues = array(
+  onSection?.({type: "header", file: {name: filename, size: bytes.length}, header: {
+    format, version, build, playerCiv, difficulty, startingEra: eraStart, era: eraEnd,
+    speed: gameSpeed, worldSize, mapScript, mapScript2, playerColor, startTurn, startYear,
+    endTurn, endYear, players, dlc, mods,
+  }});
+  const datasetKeys = await array("dataset", () => varstr(), 1000);
+  const datasetValues = await array(
     "dataset values",
-    () =>
-      array(
+    async () =>
+      await array(
         "civilization values",
-        () =>
-          array("metric value", () => ({ turn: i32(), value: i32() }), 100000),
+        async () =>
+          await array("metric value", () => ({ turn: i32(), value: i32() }), 100000),
         128,
       ),
     1000,
   );
-  const metricData = datasetKeys.map((key, index) => ({
-    key,
-    byPlayer: datasetValues.map((player) =>
-      (player[index] || []).map((sample) => ({
-        ...sample,
-        turn: sample.turn + startTurn,
-      })),
-    ),
-  }));
+  const totalReplaySamples = datasetValues.reduce((total, player) =>
+    total + player.reduce((sum, values) => sum + values.length, 0), 0);
+  const metricData = [], yieldDuringTransform = totalReplaySamples > 250_000;
+  let transformedSamples = 0;
+  for (let index = 0; index < datasetKeys.length; index++) {
+    const byPlayer = [];
+    for (const player of datasetValues) {
+      const source = player[index] || [], samples = new Array(source.length);
+      for (let sampleIndex = 0; sampleIndex < source.length; sampleIndex++) {
+        const sample = source[sampleIndex];
+        samples[sampleIndex] = {turn: sample.turn + startTurn, value: sample.value};
+        if (yieldDuringTransform && ++transformedSamples % 8192 === 0)
+          await yieldReplayTask();
+      }
+      byPlayer.push(samples);
+    }
+    metricData.push({key: datasetKeys[index], byPlayer});
+  }
+  onSection?.({type: "metrics", metrics: metricData});
   i32();
-  const events = array(
+  const events = await array(
     "event",
-    () => {
+    async () => {
       const turn = i32(),
         typeId = i32(),
-        tiles = array("event tile", () => ({ x: i16(), y: i16() }), 100000),
+        tiles = await array("event tile", () => ({ x: i16(), y: i16() }), 100000),
         civId = i32(),
         text = varstr();
       return { turn, typeId, tiles, civId, text };
@@ -642,14 +717,14 @@ function parseReplay(bytes, filename) {
     mapHeight = i32();
   if (mapWidth < 1 || mapHeight < 1 || mapWidth * mapHeight > 2_000_000)
     throw new Error("Invalid replay map dimensions.");
-  const tiles = array(
+  onSection?.({type: "map-start", mapWidth, mapHeight});
+  const tiles = await array(
     "map tile",
     () => {
-      const junk1 = i32(),
-        junk2 = i32();
+      // The first two integers are replay state metadata; the viewer never uses them.
+      i32();
+      i32();
       return {
-        stateCount: junk1,
-        stateTurn: junk2,
         plotTypeId: i8(),
         typeId: i8(),
         featureId: i8(),
@@ -667,14 +742,23 @@ function parseReplay(bytes, filename) {
     "RELIGION_FOUNDED",
     "PANTHEON_SELECTED",
   ];
-  const parsedEvents = events.map((event) => {
-    const civ =
-      players[event.civId]?.shortName || civs[event.civId]?.name || "";
+  const addParsedEvent = (event) => {
+    const civ = players[event.civId]?.shortName || civs[event.civId]?.name || "";
     const type = typeNames[event.typeId] || `EVENT_${event.typeId}`;
     const [tile] = event.tiles;
-    return { ...event, civ, type, ...tile };
-  });
-  parsedEvents.sort((a, b) => a.turn - b.turn);
+    return Object.assign(event, {civ, type, ...tile});
+  };
+  if (events.length <= 8192) events.forEach(addParsedEvent);
+  else {
+    for (let i = 0; i < events.length; i++) {
+      addParsedEvent(events[i]);
+      if ((i + 1) % 4096 === 0) {
+        onProgress?.({phase: "Preparing replay events", percent: Math.min(99, 90 + Math.floor(5 * (i + 1) / events.length))});
+        await yieldReplayTask();
+      }
+    }
+  }
+  const orderedEvents = await sortReplayEvents(events, onProgress);
   return {
     kind: "replay",
     file: { name: filename, size: bytes.length },
@@ -703,10 +787,63 @@ function parseReplay(bytes, filename) {
       mapWidth,
       mapHeight,
       tiles,
-      events: parsedEvents,
+      events: orderedEvents,
       metrics: metricData,
     },
   };
+}
+async function sortReplayEvents(events, onProgress) {
+  const compare = (a, b) => a.turn - b.turn;
+  const runSize = 32768;
+  if (events.length <= runSize) return events.sort(compare);
+  const runs = [];
+  for (let start = 0; start < events.length; start += runSize) {
+    runs.push(events.slice(start, start + runSize).sort(compare));
+    onProgress?.({phase: "Ordering replay events", percent: 95 + Math.floor(3 * Math.min(events.length, start + runSize) / events.length)});
+    await yieldReplayTask();
+  }
+  const heap = [];
+  const less = (a, b) => compare(a.event, b.event) < 0 || (a.event.turn === b.event.turn && a.run < b.run);
+  const push = (node) => {
+    let index = heap.length;
+    heap.push(node);
+    while (index) {
+      const parent = (index - 1) >> 1;
+      if (!less(heap[index], heap[parent])) break;
+      [heap[index], heap[parent]] = [heap[parent], heap[index]];
+      index = parent;
+    }
+  };
+  const pop = () => {
+    const first = heap[0], last = heap.pop();
+    if (heap.length) {
+      heap[0] = last;
+      let index = 0;
+      while (true) {
+        const left = index * 2 + 1, right = left + 1;
+        let smallest = index;
+        if (left < heap.length && less(heap[left], heap[smallest])) smallest = left;
+        if (right < heap.length && less(heap[right], heap[smallest])) smallest = right;
+        if (smallest === index) break;
+        [heap[index], heap[smallest]] = [heap[smallest], heap[index]];
+        index = smallest;
+      }
+    }
+    return first;
+  };
+  runs.forEach((run, index) => { if (run.length) push({run: index, index: 0, event: run[0]}); });
+  const sorted = new Array(events.length);
+  for (let index = 0; index < sorted.length; index++) {
+    const node = pop();
+    sorted[index] = node.event;
+    node.index++;
+    if (node.index < runs[node.run].length) {
+      node.event = runs[node.run][node.index];
+      push(node);
+    }
+    if ((index + 1) % 8192 === 0) await yieldReplayTask();
+  }
+  return sorted;
 }
 function findReplayTimeline(bytes, view, start, decoder) {
   const limit = Math.min(bytes.length - 48, start + 65536);
@@ -773,65 +910,17 @@ function findReplayTimeline(bytes, view, start, decoder) {
   }
   return -1;
 }
-function indexOfBytes(haystack, needle, start) {
-  outer: for (let i = start; i <= haystack.length - needle.length; i++) {
-    for (let j = 0; j < needle.length; j++)
-      if (haystack[i + j] !== needle[j]) continue outer;
-    return i;
-  }
-  return -1;
-}
-async function inflateSyncFlushInBrowser(raw) {
-  if (typeof DecompressionStream === "undefined")
-    throw new Error("Browser decompression is unavailable");
-  // Civ5 ends this raw DEFLATE stream at a Z_SYNC_FLUSH boundary. Add an empty final stored block so the browser inflater can finish normally.
-  const input = new Uint8Array(raw.length + 5);
-  input.set(raw);
-  input.set([1, 0, 0, 255, 255], raw.length);
-  const stream = new DecompressionStream("deflate-raw"),
-    writer = stream.writable.getWriter(),
-    reader = stream.readable.getReader();
-  let chunks = [],
-    size = 0,
-    failure = null;
-  const reading = (async () => {
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        size += value.length;
-      }
-    } catch (e) {
-      failure = e;
-    }
-  })();
-  await writer.write(input).catch((e) => {
-    failure = failure || e;
-  });
-  await writer.close().catch((e) => {
-    failure = failure || e;
-  });
-  await reading;
-  if (failure) throw failure;
-  const output = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    output.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return output;
-}
 function render(d) {
+  redrawSaveMapInPlace = null;
   if (d.kind === "replay") return renderReplay(d);
-  setAvailableTabs(["summary", "players", "metadata", "strings"]);
+  setAvailableTabs(["summary", "map", "players", "metadata", "strings"]);
   const h = d.header,
     p = d.payload;
   $("#saveTitle").textContent =
     gameEnumLabel(h.civ, "CIVILIZATION_") || "Civ V save";
   $("#savePath").textContent = d.file.name;
   $("#turn").textContent = h.turn;
-  $("#dimensions").textContent = h.worldSize.replace(/^WORLDSIZE_/, "");
+  $("#dimensions").textContent = d.saveMap ? `${d.saveMap.mapWidth} × ${d.saveMap.mapHeight}` : h.worldSize.replace(/^WORLDSIZE_/, "");
   $("#playtime").textContent = p.playedSeconds
     ? `${Math.floor(p.playedSeconds / 3600)}h ${Math.floor((p.playedSeconds % 3600) / 60)}m`
     : "—";
@@ -854,12 +943,7 @@ function render(d) {
     ["Compressed size", humanBytes(d.file.size - h.compressedOffset)],
     ["Decompressed size", humanBytes(p.bytes)],
   ];
-  $("#facts").innerHTML = fields
-    .map(
-      ([k, v]) =>
-        `<div class="fact"><span>${esc(k)}</span><b>${esc(v)}</b></div>`,
-    )
-    .join("");
+  renderFacts(fields);
   renderLobbyOptions(h.lobbyOptions || []);
   $("#dlcRecords").hidden = true;
   $("#dlcRecords").innerHTML = "";
@@ -903,12 +987,7 @@ function renderReplay(d) {
     ["Map", `${r.mapWidth} × ${r.mapHeight} · ${r.tiles.length} tiles`],
     ["Events", r.events.length],
   ];
-  $("#facts").innerHTML = fields
-    .map(
-      ([k, v]) =>
-        `<div class="fact"><span>${esc(k)}</span><b>${esc(v)}</b></div>`,
-    )
-    .join("");
+  renderFacts(fields);
   renderLobbyOptions([]);
   const dlcWrap = $("#dlcRecords");
   dlcWrap.hidden = !enabledDlc.some((item) => item.name);
@@ -918,6 +997,11 @@ function renderReplay(d) {
     .join("");
   drawPlayers(h.players.map((p, i) => ({ ...p, slot: i })));
   renderTab(activeTab);
+}
+function renderFacts(fields) {
+  $("#facts").innerHTML = fields
+    .map(([label, value]) => `<div class="fact"><span>${esc(label)}</span><b>${esc(value)}</b></div>`)
+    .join("");
 }
 function setAvailableTabs(available) {
   const allowed = new Set(available);
@@ -938,27 +1022,17 @@ function renderLobbyOptions(options) {
     .join("");
 }
 function drawPlayers(players, cityStates = null) {
-  const wrap = $("#playerOverview"),
-    isReplay = current?.kind === "replay",
-    major = players.filter(
-      (p) =>
-        p.civilization !== "CIVILIZATION_MINOR" &&
-        !(p.civilization || "").startsWith("MINOR_CIV_") &&
-        p.civilization !== "CIVILIZATION_BARBARIAN",
-    ),
-    minor = players.filter(
-      (p) =>
-        p.civilization === "CIVILIZATION_MINOR" ||
-        (p.civilization || "").startsWith("MINOR_CIV_"),
-    ),
-    barbarian = players.filter(
-      (p) => p.civilization === "CIVILIZATION_BARBARIAN",
-    );
+  const wrap = $("#playerOverview"), isReplay = current?.kind === "replay";
+  const major = [], minor = [], barbarian = [];
+  for (const player of players) {
+    const civ = player.civilization || "";
+    if (civ === "CIVILIZATION_MINOR" || civ.startsWith("MINOR_CIV_")) minor.push(player);
+    else if (civ === "CIVILIZATION_BARBARIAN") barbarian.push(player);
+    else major.push(player);
+  }
   const listedCityStates =
     cityStates ??
-    minor.map(
-      (p) => p.displayCiv || p.shortName || p.name || "Minor civilization",
-    );
+    minor.map((player) => cityStateName(player));
   if (!players.length) {
     wrap.innerHTML =
       '<div class="map-empty">Player slots were not found in the save header.</div>';
@@ -969,14 +1043,14 @@ function drawPlayers(players, cityStates = null) {
       const civ = p.civilization || "",
         label =
           civ === "CIVILIZATION_MINOR"
-            ? p.displayCiv || p.shortName || p.name || "Minor"
+            ? cityStateName(p, "Minor")
             : civ
               ? civ.startsWith("MINOR_CIV_")
                 ? civ.slice("MINOR_CIV_".length).replaceAll("_", " ")
                 : gameEnumLabel(civ, "CIVILIZATION_")
               : p.displayCiv || p.shortName || p.name || "UNKNOWN CIV",
         short = label.slice(0, 2),
-        playerName = p.displayCiv || p.name || label,
+        playerName = civ === "CIVILIZATION_MINOR" ? cityStateName(p.displayCiv || p.name, label) : p.displayCiv || p.name || label,
         steamId = steamProfileId(playerName),
         playerLabel = steamId
           ? `<a class="steam-profile" href="https://steamcommunity.com/profiles/${steamId}" target="_blank" rel="noopener noreferrer">${esc(playerName)}</a>`
@@ -991,12 +1065,17 @@ function drawPlayers(players, cityStates = null) {
           : `<img class="civ-mark civ-mark-image" style="${badgeStyle}" src="./assets/civ-icons/${esc(civKey)}.png" alt="${esc(label)} emblem" title="${esc(label)}"><span hidden class="civ-mark civ-mark-fallback" style="${badgeStyle}">${esc(short)}</span>`;
       const subtitle = isReplay
         ? p.leader || civ || label
-        : civ || p.displayCiv || label;
-      return `<div class="player-row${p.status === 3 ? " human" : ""}"><span class="player-slot">${String(p.slot).padStart(2, "0")}</span>${mark}<span class="player-info"><strong>${playerLabel}</strong><small>${esc(subtitle)}</small></span><span class="player-status">${slotStatus(p.status)}</span></div>`;
+        : civ.startsWith("CIVILIZATION_")
+          ? civ.slice("CIVILIZATION_".length)
+          : civ.startsWith("MINOR_CIV_")
+            ? civ.slice("MINOR_CIV_".length)
+            : civ || p.displayCiv || label;
+      const displaySlot = Number(p.slot) + (isReplay ? 0 : 1);
+      return `<div class="player-row${p.status === 3 ? " human" : ""}"><span class="player-slot">${String(displaySlot).padStart(2, "0")}</span>${mark}<span class="player-info"><strong>${playerLabel}</strong><small>${esc(subtitle)}</small></span><span class="player-status">${slotStatus(p.status)}</span></div>`;
     })
     .join(
       "",
-    )}</div><div class="slot-groups">${listedCityStates.length ? `<div class="slot-group">MINOR CIVILIZATIONS <b>${listedCityStates.length}</b></div>${listedCityStates.map((name) => `<div class="slot-group minor-civ">${esc(typeof name === "string" ? name : name.displayCiv || name.shortName || name.name || "Minor civilization")}</div>`).join("")}` : ""}${barbarian.length ? `<div class="slot-group">BARBARIANS <b>${barbarian.length}</b></div>` : ""}</div>`;
+    )}</div><div class="slot-groups">${listedCityStates.length ? `<div class="slot-group">MINOR CIVILIZATIONS <b>${listedCityStates.length}</b></div>${listedCityStates.map((name) => `<div class="slot-group minor-civ">${esc(cityStateName(name))}</div>`).join("")}` : ""}${barbarian.length ? `<div class="slot-group">BARBARIANS <b>${barbarian.length}</b></div>` : ""}</div>`;
   wrap.querySelectorAll(".civ-mark-image").forEach((image) =>
     image.addEventListener(
       "error",
@@ -1009,15 +1088,42 @@ function drawPlayers(players, cityStates = null) {
   );
 }
 function civBadgeColors(player) {
-  const validColor = (value) => /^#[\da-f]{6}$/i.test(String(value || ""));
-  const [civColor, civSecondary] =
-    civilizationColors[player.civilization] || [];
+  const [civColor, civSecondary] = colorTable[player.civilization] || [];
   return [
-    validColor(player.color) ? player.color : civColor || replayPalette.player,
-    validColor(player.secondaryColor)
+    isCssColor(player.color) ? player.color : civColor || replayPalette.player,
+    isCssColor(player.secondaryColor)
       ? player.secondaryColor
       : civSecondary || replayPalette.playerSecondaryNeutral,
   ];
+}
+function isCssColor(value) {
+  return /^#[\da-f]{6}$/i.test(String(value || ""));
+}
+function normalizeMapPlayerColors(players) {
+  return players.map((player) => {
+    const [civPrimary, civSecondary] = colorTable[player.civilization] || [];
+    // Saves store named palette keys, while replays may already use CSS colors.
+    // Resolve the saved key explicitly so minor civs retain their own border color.
+    const savedColorKey = String(player.color || "").trim().toUpperCase();
+    const [savedPrimary, savedSecondary] =
+      colorTable[savedColorKey] || [];
+    const fallbackHue = civHue(player.civilization || String(player.slot));
+    return {
+      ...player,
+      // Civ5 map owners are engine player IDs. Keep this separate from the
+      // display order so both replay participants and save slots resolve the
+      // same way when drawing plot ownership.
+      mapOwnerId: Number.isInteger(player.mapOwnerId)
+        ? player.mapOwnerId
+        : Number.isInteger(player.slot)
+          ? player.slot
+          : null,
+      color: isCssColor(player.color) ? player.color : savedPrimary || civPrimary || `hsl(${fallbackHue} 62% 48%)`,
+      secondaryColor: isCssColor(player.secondaryColor)
+        ? player.secondaryColor
+        : savedSecondary || civSecondary || `hsl(${(fallbackHue + 34) % 360} 48% 74%)`,
+    };
+  });
 }
 function renderTab(tab, { navigate = false } = {}) {
   activeTab = tab;
@@ -1053,7 +1159,7 @@ function renderTab(tab, { navigate = false } = {}) {
         const button = document.querySelector(`.tabs button[data-tab="${name}"]`);
         if (!button || button.hidden) continue;
         const section = document.createElement("section");
-        section.className = `card replay-section${name === "map" ? " replay-map-section wide-map" : ""}`;
+        section.className = `card replay-section${name === "map" ? " replay-map-section" : ""}`;
         section.id = `replay-section-${name}`;
         const content = document.createElement("div");
         content.className = "raw";
@@ -1116,7 +1222,7 @@ function renderTab(tab, { navigate = false } = {}) {
     eventReturnScrollY = null;
     replayBuildGeneration++;
     sectionsBox.replaceChildren();
-    const titles = { summary: "Summary", players: "Players", metadata: "Metadata", strings: "Strings" };
+    const titles = { summary: "Summary", map: "Map", players: "Players", metadata: "Metadata", strings: "Strings" };
     for (const name of Object.keys(titles)) {
       const button = document.querySelector(`.tabs button[data-tab="${name}"]`);
       if (!button || button.hidden) continue;
@@ -1133,7 +1239,55 @@ function renderTab(tab, { navigate = false } = {}) {
       replaySections.set(name, section);
       replaySectionContents.set(name, content);
       replaySectionsRendered.add(name);
-      renderSaveTab(name, current, content);
+      if (name === "map" && current.saveMap) {
+        const turn = current.header.turn;
+        const displayMap = saveMapForDisplay(current.saveMap, showRecoveredMapTiles);
+        renderReplayTab("map", { header: { startTurn: turn, endTurn: turn, players: current.header.players, turn, saveMode: true }, replay: {...displayMap, events: []} }, content);
+        const integrityFindings = (current.saveMap.integrityFindings || current.saveMap.anomalies)
+          .filter((item) => item.type !== "plot-record-decode-error");
+        if (integrityFindings.length) {
+          const alert = document.createElement("div");
+          alert.className = "save-map-anomalies";
+          const resourceMode = current.saveMap.resourceSetting.setting || "uncertain";
+          const findingLocation = (item) => {
+            let x = Number.isInteger(item.x) ? item.x : item.coordinates?.x,
+              y = Number.isInteger(item.y) ? item.y : item.coordinates?.y;
+            if ((!Number.isInteger(x) || !Number.isInteger(y)) && Number.isInteger(item.tileIndex)) {
+              x = item.tileIndex % current.saveMap.mapWidth;
+              y = Math.floor(item.tileIndex / current.saveMap.mapWidth);
+            }
+            if (!Number.isInteger(x) || !Number.isInteger(y) || x < 0 || y < 0 || x >= current.saveMap.mapWidth || y >= current.saveMap.mapHeight)
+              return "";
+            return `<span class="inline-link" role="link" tabindex="0" data-save-map-jump="${x},${y}" title="Show this tile on the map">${x + 1}, ${y + 1}</span>`;
+          };
+          alert.innerHTML = `<strong>Save integrity · ${integrityFindings.length}</strong><ul>${integrityFindings.slice(0, 100).map((item) => item.x !== undefined ? `<li>${esc(item.resource)} × ${item.quantity} at ${findingLocation(item)}${item.allowed ? ` · allowed for ${esc(resourceMode)}: ${item.allowed.join(", ")}` : ""} <code>${esc(item.type)}</code></li>` : `<li><code>${esc(item.type)}</code> · ${esc(item.message || `${item.resource}: expected ${item.expected}, found ${item.actual}`)}${findingLocation(item) ? ` · at ${findingLocation(item)}` : ""}${item.tileIndex !== undefined ? ` · plot ${item.tileIndex} · payload byte ${item.offset}` : ""}</li>`).join("")}</ul>`;
+          const jumpToFinding = (link) => {
+            const [x, y] = link.dataset.saveMapJump.split(",").map(Number);
+            document.querySelector("#mapWorld")?.scrollIntoView({ behavior: "smooth", block: "center" });
+            requestAnimationFrame(() => replayMapNavigator?.focus({ turn: current.header.turn, x, y }));
+          };
+          alert.addEventListener("click", (event) => {
+            const link = event.target.closest("[data-save-map-jump]");
+            if (link) jumpToFinding(link);
+          });
+          alert.addEventListener("keydown", (event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            const link = event.target.closest("[data-save-map-jump]");
+            if (!link) return;
+            event.preventDefault();
+            jumpToFinding(link);
+          });
+          content.prepend(alert);
+        }
+        if (!current.saveMap.complete) {
+          const note = document.createElement("p");
+          note.className = "save-map-incomplete";
+          note.textContent = `Only ${current.saveMap.parsedTiles} of ${current.saveMap.tiles.length} tile records decoded; remaining cells are placeholders. Decoder stopped at plot ${current.saveMap.decodeIssue?.tileIndex ?? "?"} (byte ${current.saveMap.decodeIssue?.offset ?? "?"}).`;
+          content.prepend(note);
+        }
+      } else if (name === "map") {
+        content.textContent = "Serialized map data was not recognized in this save.";
+      } else renderSaveTab(name, current, content);
     }
   }
   if (navigate)
@@ -1178,7 +1332,8 @@ function renderSaveTab(tab, d, box) {
           : "Minor"
         : gameEnumLabel(p.civilization, "CIVILIZATION_") ||
           "(no civilization id)";
-      return `Slot ${String(p.slot).padStart(2, "0")} · ${slotStatus(p.status)} · ${civilization}${p.leader ? ` · Leader: ${gameEnumLabel(p.leader, "LEADER_")}` : ""}${p.name ? ` · Player: ${p.name}` : ""}${p.color ? ` · Color: ${p.color}` : ""}`;
+      const displaySlot = Number(p.slot) + (current?.kind === "replay" ? 0 : 1);
+      return `Slot ${String(displaySlot).padStart(2, "0")} · ${slotStatus(p.status)} · ${civilization}${p.leader ? ` · Leader: ${gameEnumLabel(p.leader, "LEADER_")}` : ""}${p.name ? ` · Player: ${p.name}` : ""}${p.color ? ` · Color: ${p.color}` : ""}`;
     });
     setLines(playerLines.length ? playerLines : ["No player slots found."]);
   }
@@ -1343,7 +1498,7 @@ function renderReplayTab(tab, d, box) {
     const chartPlayers = h.players
       .map((player, index) => ({ player, index }))
       .filter(({ index }) => metrics.some((metric) => metric.byPlayer[index]?.length));
-    const sortedEvents = [...r.events].sort((a, b) => a.turn - b.turn);
+    const sortedEvents = r.events;
     box.innerHTML = `${metrics.length ? `<section class="event-chart-card"><div class="event-chart-head"><label class="metric-picker"><select id="eventMetricSelect">${metrics.map((m, i) => `<option value="${i}">${esc(metricLabel(m.key))}</option>`).join("")}</select></label></div><div class="event-chart-layout"><aside class="event-series-panel"><div id="eventSeriesList" class="event-series-list">${chartPlayers.map(renderSeriesOption).join("")}</div></aside><div id="eventChart" class="event-chart"></div></div></section>` : ""}${replayTable(
       ["Turn", "Year", "Type", "Civilization", "Location", "Event", ""],
       sortedEvents
@@ -1498,19 +1653,16 @@ function renderReplayTab(tab, d, box) {
     return;
   }
   if (tab === "map") {
+    const mapPlayers = normalizeMapPlayerColors(h.players);
     const mapCard = box.closest(".card"),
-      contentGrid = document.querySelector(".content-grid"),
       page = document.querySelector(".page"),
       pageStyle = page && getComputedStyle(page),
       pageContentWidth = page
-        ? page.clientWidth -
-          (Number.parseFloat(pageStyle.paddingLeft) || 0) -
-          (Number.parseFloat(pageStyle.paddingRight) || 0)
-        : 0,
-      contentGridWidth =
-        contentGrid?.getBoundingClientRect().width || pageContentWidth || mapCard.clientWidth,
-      mapInnerMinWidth = Math.max(1, contentGridWidth - 36),
-      radius = Math.max(9, mapInnerMinWidth / (2 + Math.sqrt(3) * r.mapWidth)),
+        ? page.clientWidth - (Number.parseFloat(pageStyle.paddingLeft) || 0) - (Number.parseFloat(pageStyle.paddingRight) || 0)
+        : window.innerWidth - 56,
+      layoutWidth = Math.max(mapCard.clientWidth, document.querySelector(".content-grid")?.clientWidth || 0, pageContentWidth),
+      mapCanvasMaxWidth = Math.max(1, layoutWidth - 36),
+      radius = Math.max(1, mapCanvasMaxWidth / (2 + Math.sqrt(3) * r.mapWidth)),
       hexW = Math.sqrt(3) * radius,
       canvasWidth = Math.ceil(radius * 2 + hexW * r.mapWidth),
       canvasHeight = Math.ceil(radius * 2 + radius * 1.5 * (r.mapHeight - 1));
@@ -1527,11 +1679,11 @@ function renderReplayTab(tab, d, box) {
         neighbors = y & 1
           ? [[x + 1, y, 0], [x + 1, y + 1, 5], [x, y + 1, 4], [x - 1, y, 3], [x, y - 1, 2], [x + 1, y - 1, 1]]
           : [[x + 1, y, 0], [x, y + 1, 5], [x - 1, y + 1, 4], [x - 1, y, 3], [x - 1, y - 1, 2], [x, y - 1, 1]];
-      return { x, y, key: `${x},${y}`, cx, cy, neighbors };
+      return { x, y, key: `${x},${y}`, cx, cy, neighbors, tile: r.tiles[i] };
     });
-    mapCard.style.width = `min(${Math.max(contentGridWidth, canvasWidth + 36)}px,calc(100vw - 24px))`;
-    mapCard.dataset.mapWidth = mapCard.style.width;
-    mapCard.style.boxSizing = "border-box";
+    mapCard.style.removeProperty("width");
+    mapCard.style.removeProperty("box-sizing");
+    delete mapCard.dataset.mapWidth;
     const terrainLegend = [
       ["GRASSLAND", "Grassland"],
       ["PLAINS", "Plains"],
@@ -1539,6 +1691,7 @@ function renderReplayTab(tab, d, box) {
       ["TUNDRA", "Tundra"],
       ["SNOW", "Snow"],
       ["COAST", "Coast"],
+      ["LAKE", "Lake"],
       ["OCEAN", "Ocean"],
     ];
     const opacityKey = "civ5ReplayTerritoryOpacity";
@@ -1548,11 +1701,12 @@ function renderReplayTab(tab, d, box) {
       if (localStorage.getItem(opacityKey) !== null && Number.isFinite(stored))
         initialTerritoryOpacity = Math.max(0, Math.min(100, stored));
     } catch {}
-    box.innerHTML = `<div class="map-timeline"><button id="mapPlayToggle" class="map-play-toggle" type="button" title="Play map history"><svg class="play-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg><svg class="pause-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2h4v12H3zm6 0h4v12H9z"/></svg></button><label class="metric-picker">Turn <input id="mapTurn" type="range" min="${h.startTurn}" max="${Math.max(h.startTurn, h.endTurn)}" value="${initialMapTurn}"><b id="mapTurnLabel">${initialMapTurn}</b></label><button id="mapExport" class="map-export-button" type="button">Render video</button><span id="mapExportStatus" role="status" aria-live="polite"></span></div><div class="replay-map-wrap"><div id="mapWorld" class="map-world" style="width:max(${canvasWidth}px,100%);aspect-ratio:${canvasWidth}/${canvasHeight}"><canvas class="map-layer-canvas" data-map-layer="terrain" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="elevation" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="features" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="grid" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="territory" width="${canvasWidth}" height="${canvasHeight}"></div><div id="mapTileTooltip" class="map-tile-tooltip" hidden></div><div class="map-zoom-controls"><button type="button" data-zoom="out">−</button><button type="button" data-zoom="reset">100%</button><button type="button" data-zoom="in">+</button></div></div><div class="map-layer-controls"><span>Layers</span>${[
+    box.innerHTML = `<div class="map-timeline"><button id="mapPlayToggle" class="map-play-toggle" type="button" title="Play map history"><svg class="play-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg><svg class="pause-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2h4v12H3zm6 0h4v12H9z"/></svg></button><label class="metric-picker">Turn <input id="mapTurn" type="range" min="${h.startTurn}" max="${Math.max(h.startTurn, h.endTurn)}" value="${initialMapTurn}"><b id="mapTurnLabel">${initialMapTurn}</b></label><button id="mapExport" class="map-export-button" type="button">Render video</button><span id="mapExportStatus" role="status" aria-live="polite"></span></div><div class="replay-map-wrap"><div id="mapWorld" class="map-world" style="width:${canvasWidth}px;aspect-ratio:${canvasWidth}/${canvasHeight}"><canvas class="map-layer-canvas" data-map-layer="terrain" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="elevation" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="features" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="grid" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="territory" width="${canvasWidth}" height="${canvasHeight}"></canvas></div><div id="mapTileTooltip" class="map-tile-tooltip" hidden></div><div class="map-zoom-controls"><button type="button" data-zoom="out" aria-label="Zoom out">−</button><button type="button" data-zoom="reset">100%</button><button type="button" data-zoom="in" aria-label="Zoom in">+</button><button type="button" data-map-fullscreen aria-label="Open map in fullscreen" title="Fullscreen map">⛶</button></div></div><div class="map-layer-controls"><span>Layers</span>${[
       ["terrain", "Terrain"],
       ["elevation", "Elevation"],
       ["features", "Features"],
       ["territory", "Territory"],
+      ...(h.saveMode ? [["icons", "Icons"]] : []),
       ["grid", "Grid"],
     ]
       .map(
@@ -1561,7 +1715,23 @@ function renderReplayTab(tab, d, box) {
       )
       .join(
         "",
-      )}</div><label class="metric-picker map-opacity-control">Territory overlay <input id="territoryOpacity" type="range" min="0" max="100" value="${initialTerritoryOpacity}"><b id="territoryOpacityLabel">${initialTerritoryOpacity}%</b></label><div class="map-legend" style="width:max(${canvasWidth}px,100%);max-width:100%;margin-inline:auto">${terrainLegend.map(([asset, name]) => `<span><i style="background-image:url('assets/terrain/${asset}.png')"></i>${name}</span>`).join("")}${h.players.map((p) => `<span><i style="background:${p.secondaryColor || p.color}"></i>${esc(p.displayCiv || p.shortName)}</span>`).join("")}</div>`;
+      )}</div><label class="metric-picker map-opacity-control">Territory overlay <input id="territoryOpacity" type="range" min="0" max="100" value="${initialTerritoryOpacity}"><b id="territoryOpacityLabel">${initialTerritoryOpacity}%</b></label><div class="map-legend" style="width:${canvasWidth}px;max-width:100%;margin-inline:auto">${terrainLegend.map(([asset, name]) => `<span><i style="background-image:url('assets/terrain/${asset}.png')"></i>${name}</span>`).join("")}${mapPlayers.map((p) => `<span><i style="background:${p.secondaryColor}"></i>${esc(civilizationDisplayName(p, p.slot))}</span>`).join("")}</div>`;
+    const tileDialog = document.createElement("dialog");
+    tileDialog.className = "animated-dialog tile-details-dialog";
+    tileDialog.setAttribute("aria-labelledby", "tileDetailsTitle");
+    tileDialog.innerHTML = '<header><h2 id="tileDetailsTitle">Tile details</h2><button type="button" class="tile-details-close" aria-label="Close">×</button></header><div class="tile-details-content"></div>';
+    box.append(tileDialog);
+    tileDialog.querySelector(".tile-details-close").addEventListener("click", () => tileDialog.close());
+    tileDialog.addEventListener("click", (event) => {
+      if (event.target === tileDialog) tileDialog.close();
+    });
+    const hasMapHistory = !h.saveMode && h.startTurn < h.endTurn && r.events.length > 0;
+    if (!hasMapHistory) {
+      const timeline = box.querySelector(".map-timeline");
+      timeline.hidden = true;
+      timeline.style.display = "none";
+    }
+    let tileClickStart = null;
     const world = box.querySelector("#mapWorld"),
       viewport = world.parentElement,
       range = box.querySelector("#mapTurn"),
@@ -1570,47 +1740,107 @@ function renderReplayTab(tab, d, box) {
       exportStatus = box.querySelector("#mapExportStatus"),
       opacityRange = box.querySelector("#territoryOpacity"),
       tooltip = box.querySelector("#mapTileTooltip"),
+      hoverState = { tileIndex: null },
       zoomReadout = box.querySelector('[data-zoom="reset"]'),
+      tileDetails = tileDialog.querySelector(".tile-details-content"),
       layers = Object.fromEntries(
         [...box.querySelectorAll(".map-layer-canvas")].map((canvas) => [
           canvas.dataset.mapLayer,
           { canvas, ctx: canvas.getContext("2d", { willReadFrequently: true }) },
         ]),
       );
+    const cityCanvas = document.createElement("canvas");
+    cityCanvas.className = "map-layer-canvas";
+    cityCanvas.dataset.mapLayer = "cities";
+    // City icons in saves must sit above the territory fill; the unit/icon
+    // canvas is appended later and therefore remains above cities.
+    world.insertBefore(cityCanvas, layers.territory.canvas.nextSibling);
+    layers.cities = { canvas: cityCanvas, ctx: cityCanvas.getContext("2d") };
+    const mapPixelCount = canvasWidth * canvasHeight;
     const renderScale = Math.min(
       2,
       Math.max(
         1,
         Math.sqrt(
           32_000_000 /
-            (canvasWidth * canvasHeight * Object.keys(layers).length),
+            (mapPixelCount * (Object.keys(layers).length + 1)),
         ),
       ),
     );
+    const iconRenderScale = Math.min(2, Math.sqrt(32_000_000 / mapPixelCount));
     const riverCanvas = document.createElement("canvas");
     riverCanvas.className = "map-layer-canvas";
     riverCanvas.dataset.mapLayer = "rivers";
     world.insertBefore(riverCanvas, layers.territory.canvas);
     const riverCtx = riverCanvas.getContext("2d");
     layers.rivers = { canvas: riverCanvas, ctx: riverCtx };
+    const routeCanvas = document.createElement("canvas");
+    routeCanvas.className = "map-layer-canvas";
+    routeCanvas.dataset.mapLayer = "routes";
+    world.insertBefore(routeCanvas, layers.territory.canvas);
+    layers.routes = { canvas: routeCanvas, ctx: routeCanvas.getContext("2d") };
+    const iconCanvas = document.createElement("canvas");
+    iconCanvas.className = "map-layer-canvas";
+    iconCanvas.dataset.mapLayer = "icons";
+    world.append(iconCanvas);
+    layers.icons = { canvas: iconCanvas, ctx: iconCanvas.getContext("2d") };
     const layerControls = box.querySelector(".map-layer-controls");
     if (layerControls) {
       const riverLabel = document.createElement("label");
       riverLabel.innerHTML = '<input type="checkbox" data-map-layer="rivers" checked>Rivers';
       layerControls.append(riverLabel);
+      const routeLabel = document.createElement("label");
+      routeLabel.innerHTML = '<input type="checkbox" data-map-layer="routes" checked>Roads and railroads';
+      layerControls.append(routeLabel);
+      if (h.saveMode) {
+        const recoveryLabel = document.createElement("label");
+        recoveryLabel.className = "map-recovery-option";
+        recoveryLabel.innerHTML = `<input type="checkbox" data-map-recovery ${showRecoveredMapTiles ? "checked" : ""}><span>Recover damaged sections</span>`;
+        layerControls.append(recoveryLabel);
+        recoveryLabel.querySelector("input").addEventListener("change", (event) => {
+          showRecoveredMapTiles = event.currentTarget.checked;
+          const displayMap = saveMapForDisplay(current.saveMap, showRecoveredMapTiles);
+          if (redrawSaveMapInPlace?.(displayMap)) return;
+          replaySectionsOwner = null;
+          render(current);
+        });
+      }
     }
-    for (const { canvas, ctx } of Object.values(layers)) {
-      canvas.width = Math.max(1, Math.round(canvasWidth * renderScale));
-      canvas.height = Math.max(1, Math.round(canvasHeight * renderScale));
-      ctx.scale(renderScale, renderScale);
+    for (const [name, { canvas, ctx }] of Object.entries(layers)) {
+      const layerScale = name === "icons" ? Math.max(1, iconRenderScale) : renderScale;
+      canvas.width = Math.max(1, Math.round(canvasWidth * layerScale));
+      canvas.height = Math.max(1, Math.round(canvasHeight * layerScale));
+      ctx.scale(layerScale, layerScale);
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = "high";
     }
-    const replayPlayers = new Map();
-    for (const player of h.players) {
+    const replayPlayers = new Map(), playersByTeam = new Map();
+    for (const player of mapPlayers) {
       if (player.shortName) replayPlayers.set(player.shortName, player);
       if (player.name) replayPlayers.set(player.name, player);
+      if (Number.isInteger(player.mapOwnerId)) replayPlayers.set(player.mapOwnerId, player);
+      if (Number.isInteger(player.teamId)) {
+        if (!playersByTeam.has(player.teamId)) playersByTeam.set(player.teamId, []);
+        playersByTeam.get(player.teamId).push(player);
+      }
     }
+    const playerForMapOwner = (owner) => {
+      // Replay events can store a civilization/name string, while save plots
+      // store numeric player IDs. Preserve direct replay-name lookup first.
+      const directMatch = replayPlayers.get(owner);
+      const ownerIsNumericId = Number.isInteger(owner) ||
+        (typeof owner === "string" && /^\s*-?\d+\s*$/.test(owner));
+      if (directMatch && !ownerIsNumericId)
+        return directMatch;
+      const id = Number(owner);
+      if (!Number.isInteger(id)) return null;
+      // Plot ownership is serialized as a numeric player ID. Resolve that ID
+      // against the save slot before considering display names, which can
+      // otherwise collide with numeric owner strings.
+      return mapPlayers.find((player) => player.mapOwnerId === id) ||
+        mapPlayers.find((player) => player.slot === id) ||
+        directMatch || replayPlayers.get(id) || null;
+    };
     const applyMapEvent = (e, owners, cities) => {
       if (e.type === "CITY_FOUNDED" && e.x !== undefined) {
         const key = `${e.x},${e.y}`;
@@ -1650,7 +1880,8 @@ function renderReplayTab(tab, d, box) {
         panX = (viewport.clientWidth - scaledWidth) / 2 - baseX;
       else
         panX = Math.max(viewport.clientWidth - baseX - scaledWidth, Math.min(-baseX, panX));
-      if (scaledHeight <= viewport.clientHeight) panY = 0;
+      if (scaledHeight <= viewport.clientHeight)
+        panY = (viewport.clientHeight - scaledHeight) / 2;
       else panY = Math.max(viewport.clientHeight - scaledHeight, Math.min(0, panY));
     };
     const applyZoom = () => {
@@ -1682,12 +1913,14 @@ function renderReplayTab(tab, d, box) {
           panX = panY = 0;
           applyZoom();
           tooltip.hidden = true;
+          hoverState.tileIndex = null;
           drawTerritory();
           return;
         }
         focusTileKey = `${x},${y}`;
         focusStartedAt = performance.now();
         tooltip.hidden = true;
+        hoverState.tileIndex = null;
         const animateFocus = () => {
           if (!focusTileKey || !box.contains(world)) return;
           drawTerritory();
@@ -1707,7 +1940,20 @@ function renderReplayTab(tab, d, box) {
     };
     const zoomBy = (factor, x, y) => setZoomAt(zoom * factor, x, y);
     box.querySelectorAll(".map-zoom-controls button").forEach((button) =>
-      button.addEventListener("click", () => {
+      button.addEventListener("click", async () => {
+        if (button.hasAttribute("data-map-fullscreen")) {
+          if (!document.fullscreenEnabled || typeof viewport.requestFullscreen !== "function") {
+            showNotification("Fullscreen mode is not available in this browser.");
+            return;
+          }
+          try {
+            if (document.fullscreenElement === viewport) await document.exitFullscreen();
+            else await viewport.requestFullscreen();
+          } catch (error) {
+            showNotification(`Could not open fullscreen map: ${error.message}`);
+          }
+          return;
+        }
         if (button.dataset.zoom === "reset") {
           zoom = 1;
           panX = panY = 0;
@@ -1721,6 +1967,21 @@ function renderReplayTab(tab, d, box) {
         );
       }),
     );
+    viewport.addEventListener("fullscreenchange", () => {
+      const fullscreen = document.fullscreenElement === viewport,
+        fullscreenButton = box.querySelector("[data-map-fullscreen]");
+      world.style.width = fullscreen
+        ? `min(100vw, ${(canvasWidth / canvasHeight) * 100}vh)`
+        : `${canvasWidth}px`;
+      zoom = 1;
+      panX = panY = 0;
+      if (fullscreenButton) {
+        fullscreenButton.textContent = fullscreen ? "×" : "⛶";
+        fullscreenButton.title = fullscreen ? "Exit fullscreen" : "Fullscreen map";
+        fullscreenButton.setAttribute("aria-label", fullscreen ? "Exit fullscreen" : "Open map in fullscreen");
+      }
+      requestAnimationFrame(applyZoom);
+    });
     viewport.addEventListener(
       "wheel",
       (event) => {
@@ -1738,7 +1999,9 @@ function renderReplayTab(tab, d, box) {
       zoomBy(1.5, event.clientX - rect.left, event.clientY - rect.top);
     });
     viewport.addEventListener("pointerdown", (event) => {
+      tileClickStart = null;
       if (event.target.closest(".map-zoom-controls")) return;
+      tileClickStart = event.button === 0 ? { x: event.clientX, y: event.clientY } : null;
       viewport.setPointerCapture(event.pointerId);
       const rect = viewport.getBoundingClientRect(),
         point = { x: event.clientX - rect.left, y: event.clientY - rect.top };
@@ -1808,62 +2071,257 @@ function renderReplayTab(tab, d, box) {
     viewport.addEventListener("pointerup", endPan);
     viewport.addEventListener("pointercancel", endPan);
     viewport.addEventListener("lostpointercapture", endPan);
+    let staticDrawGeneration = 0,
+      committedStaticDrawGeneration = 0,
+      saveMapUpdateVersion = 0;
     const drawStaticLayers = () => {
-      for (const layer of ["terrain", "elevation", "features", "grid", "rivers"])
-        layers[layer].ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+      const generation = ++staticDrawGeneration;
+      const tiles = r.tiles;
+      const staticLayerNames = ["terrain", "elevation", "cities", "features", "grid", "rivers", "routes", "icons"];
+      const drawLayers = Object.fromEntries(staticLayerNames.map((name) => {
+        const source = layers[name].canvas;
+        const canvas = document.createElement("canvas");
+        canvas.width = source.width;
+        canvas.height = source.height;
+        const ctx = canvas.getContext("2d");
+        ctx.scale(canvas.width / canvasWidth, canvas.height / canvasHeight);
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+        return [name, {canvas, ctx}];
+      }));
       const riverPattern = terrainImages.COAST?.complete && terrainImages.COAST.naturalWidth
-        ? layers.rivers.ctx.createPattern(terrainImages.COAST, "repeat")
+        ? drawLayers.rivers.ctx.createPattern(terrainImages.COAST, "repeat")
         : null;
       riverPattern?.setTransform?.(new DOMMatrix().scale(0.22));
-      r.tiles.forEach((tile, i) => {
+      const iconCtx = drawLayers.icons.ctx,
+        cityCtx = drawLayers.cities.ctx;
+      const drawBadge = (image, x, y, size, fallback, stroke = "#643f20", imageFilter = "none", imageScale = 1) => {
+        iconCtx.save();
+        iconCtx.fillStyle = "#fffdf0";
+        iconCtx.strokeStyle = stroke;
+        iconCtx.lineWidth = 1.25;
+        iconCtx.beginPath();
+        iconCtx.arc(x, y, size * 0.58, 0, Math.PI * 2);
+        iconCtx.fill();
+        if (image?.complete && image.naturalWidth) {
+          iconCtx.save();
+          if (imageScale > 1) {
+            iconCtx.beginPath();
+            iconCtx.arc(x, y, size * 0.58, 0, Math.PI * 2);
+            iconCtx.clip();
+          }
+          iconCtx.filter = imageFilter;
+          const imageSize = size * imageScale;
+          iconCtx.drawImage(image, x - imageSize / 2, y - imageSize / 2, imageSize, imageSize);
+          iconCtx.restore();
+        }
+        else {
+          iconCtx.fillStyle = stroke;
+          iconCtx.font = `bold ${Math.max(7, size * 0.72)}px sans-serif`;
+          iconCtx.textAlign = "center"; iconCtx.textBaseline = "middle";
+          iconCtx.fillText(fallback, x, y);
+        }
+        iconCtx.beginPath();
+        iconCtx.arc(x, y, size * 0.58, 0, Math.PI * 2);
+        iconCtx.stroke();
+        iconCtx.restore();
+      };
+      const drawFalloutOverlay = (image, x, y, size) => {
+        if (!image?.complete || !image.naturalWidth) return;
+        iconCtx.save();
+        iconCtx.globalAlpha = 0.42;
+        iconCtx.drawImage(image, x - size / 2, y - size / 2, size, size);
+        iconCtx.restore();
+      };
+      const drawPillageFlame = (x, y, size) => {
+        iconCtx.save();
+        iconCtx.translate(x, y);
+        iconCtx.scale(size, size);
+        iconCtx.shadowColor = "#f04716";
+        iconCtx.shadowBlur = 2.5;
+        iconCtx.fillStyle = "#e33a17";
+        iconCtx.beginPath();
+        iconCtx.moveTo(0, 0.5); iconCtx.bezierCurveTo(-0.48, 0.08, -0.12, -0.12, -0.18, -0.5);
+        iconCtx.bezierCurveTo(0.36, -0.16, 0.42, 0.03, 0, 0.5); iconCtx.fill();
+        iconCtx.shadowBlur = 0;
+        iconCtx.fillStyle = "#ffc247";
+        iconCtx.beginPath();
+        iconCtx.moveTo(0.02, 0.32); iconCtx.bezierCurveTo(-0.22, 0.03, 0.1, -0.02, 0.02, -0.22);
+        iconCtx.bezierCurveTo(0.25, 0.05, 0.2, 0.2, 0.02, 0.32); iconCtx.fill();
+        iconCtx.restore();
+      };
+      const drawTile = (tile, i) => {
         const x = i % r.mapWidth,
           y = Math.floor(i / r.mapWidth),
           cx = radius + hexW * (x + 0.5 * (y & 1)),
           cy = canvasY(y),
           left = cx - hexW / 2,
-          top = cy - radius;
-        traceReplayHex(layers.terrain.ctx, cx, cy, radius);
-        layers.terrain.ctx.save();
-        layers.terrain.ctx.clip();
-        const base = terrainImages[replayTerrainName(tile.typeId)];
+          top = cy - radius,
+          featureName = h.saveMode ? saveFeatureName(tile.featureHash) : "";
+        traceReplayHex(drawLayers.terrain.ctx, cx, cy, radius);
+        drawLayers.terrain.ctx.save();
+        drawLayers.terrain.ctx.clip();
+        const base = terrainImages[replayTerrainName(tile.typeId, tile.isLake)];
         if (base)
-          layers.terrain.ctx.drawImage(base, left, top, hexW, radius * 2);
+          drawLayers.terrain.ctx.drawImage(base, left, top, hexW, radius * 2);
         else {
-          layers.terrain.ctx.fillStyle = terrainColor(tile.typeId);
-          layers.terrain.ctx.fill();
+          drawLayers.terrain.ctx.fillStyle = terrainColor(tile.typeId);
+          drawLayers.terrain.ctx.fill();
         }
-        layers.terrain.ctx.restore();
+        drawLayers.terrain.ctx.restore();
         for (const [layer, name] of [
           ["elevation", replayElevationName(tile.plotTypeId)],
           ["features", replayFeatureName(tile.featureId)],
         ]) {
           const image = terrainImages[name];
           if (!image) continue;
-          const ctx = layers[layer].ctx;
+          const ctx = drawLayers[layer].ctx;
           traceReplayHex(ctx, cx, cy, radius);
           ctx.save();
           ctx.clip();
           ctx.drawImage(image, left, top, hexW, radius * 2);
           ctx.restore();
         }
+        const ctx = iconCtx, featureCtx = drawLayers.features.ctx,
+          resourceName = saveResourceName(tile.resourceHash),
+          resourceIcon = tile.resourceHash ? tileIcons[`RESOURCE_${resourceName.toUpperCase()}`] : null,
+          improvementIcon = tile.improvementName ? tileIcons[`IMPROVEMENT_${tile.improvementName}`] : null,
+          featureIcon = featureName && !replayFeaturesRenderedSeparately.includes(featureName) ? tileIcons[`FEATURE_${featureName}`] : null,
+          falloutIcon = featureName === "FALLOUT" ? tileIcons.FEATURE_FALLOUT : null;
+        const dominantFeature = ["OASIS", "ATOLL", "MARSH"].includes(featureName);
+        if (dominantFeature && featureIcon?.complete && featureIcon.naturalWidth) {
+          featureCtx.save();
+          traceReplayHex(featureCtx, cx, cy, radius);
+          featureCtx.clip();
+          featureCtx.globalAlpha = 0.92;
+          featureCtx.drawImage(featureIcon, left + hexW * 0.06, top + radius * 0.06, hexW * 0.88, radius * 1.76);
+          featureCtx.restore();
+        }
+        let resourceMarkerSize = 0, improvementMarkerSize = 0;
+        if (tile.resourceHash) {
+          resourceMarkerSize = Math.max(11, radius * 0.62);
+          drawBadge(resourceIcon, cx, cy, resourceMarkerSize, "R", tile.quantityOutsideRules ? "#b42318" : "#643f20");
+        }
+        if (tile.improvementHash) {
+          improvementMarkerSize = Math.max(9, radius * 0.42);
+          const ix = cx + radius * 0.49, iy = cy + radius * 0.44;
+          drawBadge(improvementIcon, ix, iy, improvementMarkerSize, tile.improvementPillaged ? "×" : "I", tile.improvementPillaged ? "#b42318" : "#643f20", tile.improvementPillaged ? "grayscale(1) brightness(.82)" : "none");
+          if (tile.improvementPillaged) drawPillageFlame(ix + improvementMarkerSize * 0.42, iy - improvementMarkerSize * 0.4, improvementMarkerSize * 0.72);
+        }
+        if (falloutIcon) {
+          if (resourceMarkerSize) drawFalloutOverlay(falloutIcon, cx, cy, resourceMarkerSize);
+          if (improvementMarkerSize) drawFalloutOverlay(falloutIcon, cx + radius * 0.49, cy + radius * 0.44, improvementMarkerSize);
+          if (!resourceMarkerSize && !improvementMarkerSize) drawBadge(falloutIcon, cx, cy, Math.max(13, radius * 0.72), "F", "#68714a");
+        }
+        if (tile.resourceHash && tile.resourceAmount > 1) {
+          const amountBaseSize = tile.improvementHash ? improvementMarkerSize : resourceMarkerSize,
+            amountBaseX = tile.improvementHash ? cx + radius * 0.49 : cx,
+            amountBaseY = tile.improvementHash ? cy + radius * 0.44 : cy,
+            amountX = amountBaseX + amountBaseSize * 0.38,
+            amountY = amountBaseY + amountBaseSize * 0.38;
+          ctx.save();
+          ctx.fillStyle = "#fffdf0"; ctx.strokeStyle = "#643f20"; ctx.lineWidth = 0.8;
+          ctx.beginPath(); ctx.arc(amountX, amountY, Math.max(4, amountBaseSize * 0.3), 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+          ctx.fillStyle = "#2f251b"; ctx.font = `bold ${Math.max(6, amountBaseSize * 0.4)}px sans-serif`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+          ctx.fillText(String(tile.resourceAmount), amountX, amountY); ctx.restore();
+        }
+        if (tile.featureHash && !dominantFeature && !replayFeaturesRenderedSeparately.includes(featureName)) drawBadge(featureIcon, cx - radius * 0.48, cy - radius * 0.42, Math.max(9, radius * 0.4), "F", "#315d3c");
+        if (tile.underConstructionHash && !tile.improvementHash && tile.buildProgress?.some(({progress}) => progress > 0)) drawBadge(tileIcons[`IMPROVEMENT_${saveImprovementName(tile.underConstructionHash)}`], cx + radius * 0.48, cy - radius * 0.03, Math.max(9, radius * 0.38), "…", "#8b5e20");
+        if (tile.units?.length) {
+          const unit = tile.units[0], portraitIcon = unit.type && tileIcons[`UNIT_PORTRAIT_${unit.type}`];
+          drawBadge(portraitIcon || tileIcons.ICON_UNIT_STACK, cx + radius * 0.48, cy - radius * 0.42,
+            Math.max(9, radius * 0.4), tile.units.length > 9 ? "U" : String(tile.units.length), "#3a4f73", "none", portraitIcon ? 1.4 : 1);
+        }
+        if (tile.dataUnavailable) {
+          const grid = drawLayers.grid.ctx;
+          grid.save();
+          traceReplayHex(grid, cx, cy, radius);
+          grid.fillStyle = "rgba(139, 94, 32, 0.42)";
+          grid.fill();
+          grid.fillStyle = "#fffdf0";
+          grid.font = `bold ${Math.max(12, radius * 0.9)}px sans-serif`;
+          grid.textAlign = "center";
+          grid.textBaseline = "middle";
+          grid.fillText("?", cx, cy);
+          grid.restore();
+        }
         drawReplayRiver(
-          layers.rivers.ctx,
+          drawLayers.rivers.ctx,
           cx,
           cy,
           radius,
           tile.riverMask,
           riverPattern,
         );
-        traceReplayHex(layers.grid.ctx, cx, cy, radius);
-        layers.grid.ctx.strokeStyle = replayPalette.mapGrid;
-        layers.grid.ctx.lineWidth = 0.5;
-        layers.grid.ctx.stroke();
-      });
+        const grid = drawLayers.grid.ctx;
+        traceReplayHex(grid, cx, cy, radius);
+        grid.strokeStyle = replayPalette.mapGrid;
+        grid.lineWidth = 0.5;
+        grid.stroke();
+      };
+      const drawBatch = (start) => {
+        if (!box.contains(world)) return;
+        const end = Math.min(tiles.length, start + 1024);
+        for (let i = start; i < end; i++) drawTile(tiles[i], i);
+        if (end < tiles.length) {
+          setTimeout(() => drawBatch(end), 0);
+          return;
+        }
+      drawReplayRoutes(drawLayers.routes.ctx, tiles, r.mapWidth, r.mapHeight, radius, hexW, canvasY);
+      if (h.saveMode) {
+        const savedCities = new Map((r.cities || []).map((city) => [`${city.owner}:${city.id}`, city]));
+        for (const tile of tiles) {
+          const cityRef = tile.plotCity;
+          if (cityRef?.owner < 0 || cityRef?.id < 0 || cityRef?.owner == null || cityRef?.id == null) continue;
+          const key = `${cityRef.owner}:${cityRef.id}`;
+          if (!savedCities.has(key))
+            savedCities.set(key, {...cityRef, x: tile.x, y: tile.y, razingTurns: 0});
+        }
+        for (const city of savedCities.values()) {
+          const cx = radius + hexW * (city.x + 0.5 * (city.y & 1)),
+            cy = canvasY(city.y),
+            player = replayPlayers.get(city.owner),
+            isMinor = player?.civilization === "CIVILIZATION_MINOR" || (player?.civilization || "").startsWith("MINOR_CIV_"),
+            cityName = player?.displayCiv || player?.shortName || player?.name || "",
+            cityTrait = cityStateTraits[normalizeReplayName(cityName)],
+            cityImage = isMinor ? (cityTrait && cityIcons[cityTrait]) || cityIcons.CIV_CS_ICON : cityIcons.CIV_CITY_ICON,
+            citySize = Math.min(hexW * 0.72, radius * 1.35);
+          if (cityImage?.complete && cityImage.naturalWidth) {
+            cityCtx.save();
+            traceReplayHex(cityCtx, cx, cy, radius);
+            cityCtx.clip();
+            cityCtx.globalAlpha = isMinor ? 0.9 : 0.76;
+            cityCtx.drawImage(cityImage, cx - citySize / 2, cy - citySize / 2, citySize, citySize);
+            cityCtx.restore();
+          }
+          if (city.razingTurns > 0 && cityIcons.CITY_FIRING?.complete && cityIcons.CITY_FIRING.naturalWidth) {
+            const fireSize = Math.min(hexW * 0.56, radius * 1.05);
+            cityCtx.save();
+            traceReplayHex(cityCtx, cx, cy, radius);
+            cityCtx.clip();
+            cityCtx.drawImage(cityIcons.CITY_FIRING, cx - fireSize / 2, cy - fireSize / 2, fireSize, fireSize);
+            cityCtx.restore();
+          }
+        }
+      }
+      if (generation <= committedStaticDrawGeneration || !box.contains(world)) return;
+      for (const name of staticLayerNames) {
+        const target = layers[name].ctx;
+        target.save();
+        target.setTransform(1, 0, 0, 1, 0, 0);
+        target.clearRect(0, 0, target.canvas.width, target.canvas.height);
+        target.drawImage(drawLayers[name].canvas, 0, 0);
+        target.restore();
+      }
+      committedStaticDrawGeneration = generation;
+      };
+      drawBatch(0);
     };
     const terrainImages = loadReplayTerrainImages();
     const cityIcons = loadReplayCityIcons();
+    const tileIcons = h.saveMode ? loadReplayTileIcons(r.tiles, radius) : {};
     drawStaticLayers();
-    terrainImages.ready.then(() => {
+    Promise.all([terrainImages.ready, cityIcons.ready, tileIcons.ready]).then(() => {
       if (box.contains(world)) drawStaticLayers();
     });
     viewport.addEventListener("dragstart", (event) => event.preventDefault());
@@ -1878,15 +2336,30 @@ function renderReplayTab(tab, d, box) {
           if (e.turn > turn) break;
           applyMapEvent(e, owners, cities);
         }
+        if (h.saveMode) {
+          r.tiles.forEach((tile) => {
+            const key = `${tile.x},${tile.y}`;
+            if (tile.owner >= 0) owners.set(key, tile.owner);
+            if (tile.plotCity?.owner >= 0 && tile.plotCity?.id >= 0 && !cities.has(key))
+              cities.set(key, {x: tile.x, y: tile.y, owner: tile.plotCity.owner, id: tile.plotCity.id, eventText: `City #${tile.plotCity.id}`});
+          });
+          for (const city of r.cities || []) cities.set(`${city.x},${city.y}`, {
+            ...city,
+            eventText: `${saveCityDisplayName(city.name)} · ${city.population} population`,
+          });
+        }
       }
       currentOwners = owners;
       currentCities = cities;
-      territoryTiles.forEach(({ key, cx, cy }) => {
+      territoryTiles.forEach(({ key, cx, cy, tile }) => {
         const owner = owners.get(key),
-          player = replayPlayers.get(owner);
+          player = playerForMapOwner(owner);
         if (!player && key !== focusTileKey) return;
         traceReplayHex(ctx, cx, cy, radius);
-        const city = cities.get(key),
+        const city = cities.get(key) ||
+            (h.saveMode && tile.plotCity?.owner >= 0 && tile.plotCity?.id >= 0
+              ? tile.plotCity
+              : null),
           isCityState =
             player?.civilization === "CIVILIZATION_MINOR" ||
             (player?.civilization || "").startsWith("MINOR_CIV_"),
@@ -1894,13 +2367,15 @@ function renderReplayTab(tab, d, box) {
             city &&
             !isCityState &&
             player.civilization !== "CIVILIZATION_BARBARIAN";
+        // The second palette swatch is the visible color for minor civs:
+        // their first swatch is black for every city-state palette entry.
         const cityColor = player?.secondaryColor || player?.color;
         ctx.fillStyle = !player
           ? "rgba(255, 205, 54, .5)"
           : isCityState
             ? city
               ? cityColor
-              : replayPalette.unclaimedMinor
+              : player.color
             : isMajorCity
               ? player.color
               : cityColor;
@@ -1908,8 +2383,8 @@ function renderReplayTab(tab, d, box) {
       });
       territoryTiles.forEach(({ key, cx, cy, neighbors }) => {
         const owner = owners.get(key);
-        if (!owner) return;
-        const player = replayPlayers.get(owner);
+        if (owner === undefined || owner === null || owner === "") return;
+        const player = playerForMapOwner(owner);
         if (!player) return;
         const isCityState =
             player.civilization === "CIVILIZATION_MINOR" ||
@@ -1935,10 +2410,10 @@ function renderReplayTab(tab, d, box) {
           }
         }
       });
-      for (const city of cities.values()) {
+      if (!h.saveMode) for (const city of cities.values()) {
         const cx = radius + hexW * (city.x + 0.5 * (city.y & 1)),
           cy = canvasY(city.y),
-          player = replayPlayers.get(city.owner);
+          player = playerForMapOwner(city.owner);
         if (
           player?.civilization === "CIVILIZATION_MINOR" ||
           (player?.civilization || "").startsWith("MINOR_CIV_")
@@ -2016,30 +2491,125 @@ function renderReplayTab(tab, d, box) {
         tile = tileIndex < 0 ? null : r.tiles[tileIndex];
       if (!tile) {
         tooltip.hidden = true;
+        hoverState.tileIndex = null;
         return;
       }
+      if (hoverState.tileIndex === tileIndex) return;
+      hoverState.tileIndex = tileIndex;
       const x = tileIndex % r.mapWidth,
         y = Math.floor(tileIndex / r.mapWidth),
+        hasUnmappedFeature = tile.featureHash && tile.featureId < 0,
         owner = currentOwners.get(`${x},${y}`),
         city = currentCities.get(`${x},${y}`),
-        player = replayPlayers.get(owner),
+        player = playerForMapOwner(owner),
+        playerName = (slot) => civilizationDisplayName(playerForMapOwner(slot), slot),
+        visibleTeamIds = orderVisibilityTeamIds((tile.visibilityCount || [])
+          .map((count, teamId) => count > 0 && teamId < 64 ? teamId : -1)
+          .filter((teamId) => teamId >= 0)),
+        visibleTeamNames = visibleTeamIds.map((teamId) => replayTeamDisplayName(teamId, playersByTeam)),
+        exploredTeamIds = orderVisibilityTeamIds((tile.revealedFlags || []).flatMap((word, wordIndex) =>
+          Array.from({length: 32}, (_, bit) => wordIndex * 32 + bit)
+            .filter((teamId) => teamId < 64 && ((word >>> (teamId % 32)) & 1)),
+        )),
+        exploredTeamNames = exploredTeamIds.map((teamId) => replayTeamDisplayName(teamId, playersByTeam)),
+        crossingDirections = replayRiverCrossingLabel(tile.riverCrossing),
+        anchorNames = ["Natural wonder", "Settler", "Worker"],
+        archaeology = replayArchaeologyLabel(tile.archaeology, playerName),
         details = [
           `Tile ${x + 1}, ${y + 1}`,
-          replayTerrainLabel(tile.typeId),
+          replayTerrainLabel(tile.typeId, tile.isLake),
           replayElevationLabel(tile.plotTypeId),
-          replayFeatureLabel(tile.featureId),
+          tile.featureName ? `Feature: ${tile.featureName.replaceAll("_", " ")}` : hasUnmappedFeature ? `Unknown feature · ${tile.featureHash.toString(16).padStart(8, "0")}` : replayFeatureLabel(tile.featureId),
+          tile.resourceHash ? `${saveResourceName(tile.resourceHash)}${tile.resourceAmount > 1 ? ` · ${tile.resourceAmount}` : ""}` : "",
+          tile.improvementHash ? `${tile.improvementName ? tile.improvementName.replaceAll("_", " ") : `Unknown improvement ${tile.improvementHash.toString(16).padStart(8, "0")}`}${tile.improvementPillaged ? " · pillaged" : ""}` : "",
+          tile.underConstructionHash && !tile.improvementHash && tile.buildProgress?.some(({progress}) => progress > 0) ? `Under construction · ${saveImprovementName(tile.underConstructionHash).replaceAll("_", " ") || tile.underConstructionHash.toString(16).padStart(8, "0")}` : "",
+          tile.routeId === 0 ? `Road${tile.routePillaged ? " · pillaged" : ""}` : tile.routeId === 1 ? `Railroad${tile.routePillaged ? " · pillaged" : ""}` : "",
+          tile.dataUnavailable ? "Tile fields not decoded · placeholder" : "",
           replayRiverLabel(tile.riverMask),
-          player ? player.displayCiv || player.shortName : owner || "Unclaimed",
-          city?.eventText || "",
+          player ? civilizationDisplayName(player, owner) : owner !== undefined && owner >= 0 ? civilizationDisplayName(null, owner) : "Unclaimed",
+          tile.units?.length ? `Units: ${tile.units.map((unit) => unitDisplayName(unit, playerName)).join(", ")}` : "",
+          h.saveMode && tile.city
+            ? `${saveCityDisplayName(tile.city.name)} · ${tile.city.population} population`
+            : h.saveMode && tile.plotCity?.owner >= 0 && tile.plotCity?.id >= 0
+              ? `${playerName(tile.plotCity.owner)} · #${tile.plotCity.id}`
+              : "",
+          tile.culture ? `Culture stored here: ${tile.culture}` : "",
+          tile.ownershipDuration ? `Owned for ${tile.ownershipDuration} turns` : "",
+          tile.improvementDuration ? `Improvement built ${tile.improvementDuration} turns ago` : "",
+          tile.upgradeProgress ? `Improvement upgrade progress: ${tile.upgradeProgress}` : "",
+          tile.playerBuiltImprovement >= 0 ? `Improvement built by ${playerName(tile.playerBuiltImprovement)}` : "",
+          Number.isInteger(tile.worldAnchor) && anchorNames[tile.worldAnchor] ? `Map marker: ${anchorNames[tile.worldAnchor]}` : "",
+          tile.startingPlot ? "Starting location" : "",
+          tile.potentialCityWork ? "Can be worked by a nearby city" : "",
+          crossingDirections,
+          exploredTeamNames.length ? `Explored by: ${exploredTeamNames.join(", ")}` : "",
+          visibleTeamNames.length ? `Currently visible to: ${visibleTeamNames.join(", ")}` : "",
+          tile.resourceForceReveal?.some(Boolean) ? `Resource revealed to ${tile.resourceForceReveal.filter(Boolean).length} teams` : "",
+          tile.revealedOwner?.some((value) => value >= 0 && value !== owner) ? `Last known owner: ${[...new Set(tile.revealedOwner.filter((value) => value >= 0 && value !== owner).map(playerName))].join(", ")}` : "",
+          tile.revealedImprovement?.some((hash) => hash && hash !== tile.improvementHash) ? `Previously seen improvements: ${[...new Set(tile.revealedImprovement.filter((hash) => hash && hash !== tile.improvementHash).map((hash) => saveImprovementName(hash)?.replaceAll("_", " ") || "unknown improvement"))].join(", ")}` : "",
+          tile.revealedRoute?.some((value) => value >= 0) ? `Previously seen routes: ${[...new Set(tile.revealedRoute.filter((value) => value >= 0).map((value) => value === 0 ? "road" : value === 1 ? "railroad" : "other route"))].join(", ")}` : "",
+          archaeology,
+          tile.yields?.some(Boolean) ? {html: `<span class="tile-yield-list" aria-label="Tile yields">${tile.yields.map((value, i) => value ? `<span class="tile-yield" title="${replayYieldNames[i]} ${value}"><img src="assets/civ5-icons/${replayYieldIcons[i]}.png" alt="">${value}</span>` : "").filter(Boolean).join("")}</span>`} : "",
+          !h.saveMode && city?.eventText ? `Event: ${city.eventText}` : "",
         ],
         viewportRect = viewport.getBoundingClientRect();
-      tooltip.textContent = details.filter(Boolean).join(" · ");
+      tooltip.innerHTML = details.filter(Boolean).map((detail, index) => `<div class="tile-tooltip-row${index === 0 ? " tile-tooltip-title" : ""}">${typeof detail === "string" ? esc(detail) : detail.html}</div>`).join("");
       tooltip.hidden = false;
       tooltip.style.left = `${Math.max(8, Math.min(event.clientX - viewportRect.left + 14, viewport.clientWidth - tooltip.offsetWidth - 8))}px`;
       tooltip.style.top = `${Math.max(8, Math.min(event.clientY - viewportRect.top + 14, viewport.clientHeight - tooltip.offsetHeight - 8))}px`;
     });
+    viewport.addEventListener("click", (event) => {
+      if (!tileClickStart || Math.hypot(event.clientX - tileClickStart.x, event.clientY - tileClickStart.y) > 5 || event.target.closest(".map-zoom-controls")) {
+        tileClickStart = null;
+        return;
+      }
+      tileClickStart = null;
+      const rect = world.getBoundingClientRect(),
+        px = ((event.clientX - rect.left) * canvasWidth) / rect.width,
+        py = canvasHeight - ((event.clientY - rect.top) * canvasHeight) / rect.height,
+        index = locateReplayTile(px, py, r.mapWidth, r.mapHeight, radius, hexW),
+        tile = index < 0 ? null : r.tiles[index];
+      if (!tile) return;
+      const x = index % r.mapWidth,
+        y = Math.floor(index / r.mapWidth),
+        owner = currentOwners.get(`${x},${y}`),
+        city = currentCities.get(`${x},${y}`),
+        label = (key) => key.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/^./, (letter) => letter.toUpperCase()),
+        format = (value) => {
+          if (value === null || value === undefined || value === "") return "—";
+          if (typeof value === "boolean") return value ? "Yes" : "No";
+          if (Array.isArray(value) || ArrayBuffer.isView(value)) return [...value].map((item) => typeof item === "number" && item < 0 ? "—" : item).join(", ") || "—";
+          if (typeof value === "object") return Object.entries(value).map(([key, item]) => `${label(key)}: ${format(item)}`).join(" · ");
+          return String(value);
+        },
+        fields = [
+          ["Coordinates", `${x + 1}, ${y + 1}`],
+          ["Terrain", replayTerrainLabel(tile.typeId, tile.isLake)],
+          ["Relief", replayElevationLabel(tile.plotTypeId)],
+          ["Feature", tile.featureName?.replaceAll("_", " ") || (tile.featureHash ? `Unknown (${tile.featureHash.toString(16).padStart(8, "0")})` : replayFeatureLabel(tile.featureId))],
+          ["Resource", tile.resourceHash ? `${saveResourceName(tile.resourceHash)}${tile.resourceAmount > 1 ? ` × ${tile.resourceAmount}` : ""}` : "None"],
+          ["Improvement", tile.improvementHash ? `${tile.improvementName?.replaceAll("_", " ") || `Unknown (${tile.improvementHash.toString(16).padStart(8, "0")})`}${tile.improvementPillaged ? " (pillaged)" : ""}` : "None"],
+          ["Route", tile.routeId === 0 ? `Road${tile.routePillaged ? " (pillaged)" : ""}` : tile.routeId === 1 ? `Railroad${tile.routePillaged ? " (pillaged)" : ""}` : "None"],
+          ["Owner", owner >= 0 ? civilizationDisplayName(playerForMapOwner(owner), owner) : "Unclaimed"],
+          ["Units", tile.units?.map((unit) => unitDisplayName(unit, (slot) => civilizationDisplayName(playerForMapOwner(slot), slot))).join(", ") || "None"],
+          ...(tile.city
+            ? [["City", `${saveCityDisplayName(tile.city.name)} · ${tile.city.population} population`]]
+            : h.saveMode && tile.plotCity?.owner >= 0
+              ? [["City", `${civilizationDisplayName(playerForMapOwner(tile.plotCity.owner), tile.plotCity.owner)} · #${tile.plotCity.id}`]]
+              : []),
+          ...(!h.saveMode && city?.eventText ? [["Event", city.eventText]] : []),
+          ["Yields", tile.yields?.map((value, i) => value ? `${replayYieldNames[i]} ${value}` : "").filter(Boolean).join(" · ") || "—"],
+          ...Object.entries(tile).filter(([key]) => !["x", "y", "typeId", "plotTypeId", "landmassId", "isLake", "featureId", "featureHash", "featureName", "resourceHash", "resourceAmount", "improvementHash", "improvementName", "improvementPillaged", "routeId", "routePillaged", "owner", "plotCity", "city", "yields", "units", "dataUnavailable"].includes(key)).map(([key, value]) => [label(key), format(value)]),
+          ...(tile.dataUnavailable ? [["Decode status", "Tile fields were not decoded; map placeholder shown"]] : []),
+        ];
+      tileDialog.querySelector("#tileDetailsTitle").textContent = `Tile ${x + 1}, ${y + 1}`;
+      tileDetails.innerHTML = `<dl>${fields.map(([key, value]) => `<div><dt>${esc(key)}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl>`;
+      tooltip.hidden = true;
+      if (!tileDialog.open) tileDialog.showModal();
+    });
     viewport.addEventListener("mouseleave", () => {
       tooltip.hidden = true;
+      hoverState.tileIndex = null;
     });
     box.querySelectorAll("[data-map-layer]").forEach((input) =>
       input.addEventListener("change", () => {
@@ -2057,6 +2627,7 @@ function renderReplayTab(tab, d, box) {
     });
     range.addEventListener("input", () => {
       tooltip.hidden = true;
+      hoverState.tileIndex = null;
       drawTerritory();
     });
     let playbackTimer = 0;
@@ -2076,7 +2647,7 @@ function renderReplayTab(tab, d, box) {
     });
     const exportDialog = document.createElement("dialog");
     const exportSourceCanvas = Object.values(layers)[0].canvas;
-    exportDialog.className = "map-export-dialog";
+    exportDialog.className = "animated-dialog map-export-dialog";
     exportDialog.innerHTML = `<form class="map-export-form"><div class="map-export-heading"><h3>Video export settings</h3><button class="map-export-close" type="button">×</button></div><label>Duration per turn <span><input name="frameDuration" type="range" min="50" max="1000" step="50" value="250"><b data-value="frameDuration">250 ms</b></span></label><label>Bitrate <span><input name="bitrate" type="range" min="500000" max="12000000" step="250000" value="2500000"><b data-value="bitrate">2.5 Mbps</b></span></label><label>Maximum width <select name="maxWidth"><option value="0">Original</option><option value="2560">2560 px</option><option value="1920">1920 px</option><option value="1280">1280 px</option></select></label><label>Codec <select name="codec"><option value="auto">Automatic (VP9 preferred)</option><option value="vp9">VP9</option><option value="vp8">VP8</option></select></label><div class="map-export-estimate"><span>Frame rate</span><b data-estimate="fps">4 fps</b><span>Output resolution</span><b data-estimate="resolution">—</b><span>Video duration</span><b data-estimate="duration">—</b></div><div class="map-export-actions"><button type="button" data-action="cancel">Cancel</button><button type="submit">Render &amp; download</button></div></form>`;
     box.append(exportDialog);
     const exportForm = exportDialog.querySelector("form"),
@@ -2259,6 +2830,23 @@ function renderReplayTab(tab, d, box) {
       exportDialog.close();
       await runExport(settings);
     });
+    if (h.saveMode) {
+      redrawSaveMapInPlace = (displayMap) => {
+        if (!box.contains(world)) return false;
+        const version = ++saveMapUpdateVersion;
+        const nextTileIcons = loadReplayTileIcons(displayMap.tiles, radius);
+        nextTileIcons.ready.then(() => {
+          if (version !== saveMapUpdateVersion || !box.contains(world)) return;
+          Object.assign(tileIcons, nextTileIcons);
+          r.tiles = displayMap.tiles;
+          r.cities = displayMap.cities;
+          territoryTiles.forEach((entry, index) => { entry.tile = r.tiles[index]; });
+          drawStaticLayers();
+          drawTerritory();
+        });
+        return true;
+      };
+    }
     drawTerritory();
     cityIcons.ready.then(() => {
       if (box.contains(world)) drawTerritory();
@@ -2327,63 +2915,128 @@ function drawReplayRiver(ctx, cx, cy, radius, mask, texture) {
   }
   ctx.restore();
 }
-function loadReplayTerrainImages() {
+function drawReplayRoutes(ctx, tiles, mapWidth, mapHeight, radius, hexW, canvasY) {
+  if (!ctx) return;
+  const center = (x, y) => [radius + hexW * (x + 0.5 * (y & 1)), canvasY(y)];
+  const strokeSegment = (start, end, routeId, pillaged) => {
+    const [x1, y1] = start, [x2, y2] = end;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.setLineDash(pillaged ? [Math.max(2, radius * 0.22), Math.max(1.5, radius * 0.16)] : []);
+    ctx.strokeStyle = "rgba(32, 27, 22, .88)";
+    ctx.lineWidth = radius * (routeId === 1 ? 0.28 : 0.24);
+    ctx.stroke();
+    ctx.strokeStyle = routeId === 1 ? "#bdb8ad" : "#b69762";
+    ctx.lineWidth = radius * (routeId === 1 ? 0.17 : 0.13);
+    ctx.stroke();
+    if (routeId === 1 && !pillaged) {
+      ctx.setLineDash([Math.max(1.5, radius * 0.12), Math.max(1.5, radius * 0.12)]);
+      ctx.strokeStyle = "#48443d";
+      ctx.lineWidth = Math.max(0.7, radius * 0.045);
+      ctx.stroke();
+    } else if (routeId === 0 && !pillaged) {
+      ctx.setLineDash([]);
+      ctx.strokeStyle = "rgba(255, 231, 177, .8)";
+      ctx.lineWidth = Math.max(0.55, radius * 0.035);
+      ctx.stroke();
+    }
+    ctx.restore();
+  };
+  const connect = (x1, y1, x2, y2) => {
+    if (x2 < 0 || x2 >= mapWidth || y2 < 0 || y2 >= mapHeight) return;
+    const a = tiles[y1 * mapWidth + x1], b = tiles[y2 * mapWidth + x2];
+    if (!a || !b || a.dataUnavailable || b.dataUnavailable || ![0, 1].includes(a.routeId) || ![0, 1].includes(b.routeId)) return;
+    const start = center(x1, y1), end = center(x2, y2);
+    if (a.routeId === b.routeId) {
+      strokeSegment(start, end, a.routeId, a.routePillaged || b.routePillaged);
+      return;
+    }
+    const midpoint = [(start[0] + end[0]) / 2, (start[1] + end[1]) / 2];
+    strokeSegment(start, midpoint, a.routeId, a.routePillaged);
+    strokeSegment(midpoint, end, b.routeId, b.routePillaged);
+  };
+  for (let y = 0; y < mapHeight; y++) {
+    for (let x = 0; x < mapWidth; x++) {
+      connect(x, y, x + 1, y);
+      const lowerRowX = y & 1 ? x : x - 1;
+      connect(x, y, lowerRowX, y + 1);
+      connect(x, y, lowerRowX + 1, y + 1);
+    }
+  }
+}
+function loadReplayImages(names, sourceFor, keyFor = (name) => name) {
   const images = {};
-  const names = [
-    "GRASSLAND",
-    "PLAINS",
-    "DESERT",
-    "TUNDRA",
-    "SNOW",
-    "COAST",
-    "OCEAN",
-    "MOUNTAIN",
-    "HILLS",
-    "ICE",
-    "JUNGLE",
-    "FOREST",
-  ];
-  images.ready = Promise.all(
-    names.map(
-      (name) =>
-        new Promise((resolve) => {
-          const image = new Image();
-          image.onload = () => {
-            images[name] = image;
-            resolve();
-          };
-          image.onerror = resolve;
-          image.src = `assets/terrain/${name}.png`;
-        }),
-    ),
-  );
+  images.ready = Promise.all([...names].map((name) => new Promise((resolve) => {
+    const image = new Image();
+    image.onload = () => { images[keyFor(name)] = image; resolve(); };
+    image.onerror = resolve;
+    image.src = sourceFor(name);
+  })));
   return images;
 }
+function loadReplayTerrainImages() {
+  const names = "GRASSLAND PLAINS DESERT TUNDRA SNOW COAST OCEAN LAKE MOUNTAIN HILLS ICE JUNGLE FOREST".split(" ");
+  return loadReplayImages(names, (name) => `assets/terrain/${name}.png`);
+}
 function loadReplayCityIcons() {
-  const images = {};
-  const names = [
-    "CIV_CITY_ICON",
-    "CIV_CS_ICON",
-    "Cultured",
-    "Maritime",
-    "Mercantile",
-    "Militaristic",
-    "Religious",
-  ];
-  images.ready = Promise.all(
-    names.map(
-      (name) =>
-        new Promise((resolve) => {
-          const image = new Image();
-          image.onload = () => {
-            images[name === "CIV_CS_ICON" ? name : name.toUpperCase()] = image;
-            resolve();
-          };
-          image.onerror = resolve;
-          image.src = `assets/civ5-icons/${name}.png`;
-        }),
-    ),
+  const names = ["CIV_CITY_ICON", "CIV_CS_ICON", "CITY_FIRING", "Cultured", "Maritime", "Mercantile", "Militaristic", "Religious"];
+  return loadReplayImages(
+    names,
+    (name) => `assets/civ5-icons/${name}.png`,
+    (name) => name === "CIV_CS_ICON" ? name : name.toUpperCase(),
   );
+}
+function loadReplayTileIcons(tiles, radius) {
+  const names = new Set();
+  for (const tile of tiles) {
+    const resource = saveResourceName(tile.resourceHash);
+    if (tile.resourceHash && !resource.startsWith("Unknown resource ")) names.add(`RESOURCE_${resource.toUpperCase()}`);
+    const improvement = saveImprovementName(tile.improvementHash);
+    if (tile.improvementHash && improvement) names.add(`IMPROVEMENT_${improvement}`);
+    const plannedImprovement = saveImprovementName(tile.underConstructionHash);
+    if (tile.underConstructionHash && !tile.improvementHash && tile.buildProgress?.some(({progress}) => progress > 0) && plannedImprovement) names.add(`IMPROVEMENT_${plannedImprovement}`);
+    const feature = saveFeatureName(tile.featureHash);
+    if (tile.featureHash && feature && !["ICE", "JUNGLE", "FOREST", "FLOOD_PLAINS"].includes(feature)) names.add(`FEATURE_${feature}`);
+    if (tile.units?.length) {
+      names.add("ICON_UNIT_STACK");
+      for (const unit of tile.units) if (unit.type) names.add(`UNIT_PORTRAIT_${unit.type}`);
+    }
+  }
+  const images = loadReplayImages(names, (name) => name.startsWith("UNIT_PORTRAIT_")
+    ? `assets/unit-portraits/${name.slice("UNIT_PORTRAIT_".length)}.png`
+    : `assets/civ5-icons/${name}.png`);
+  images.ready = images.ready.then(() => {
+    const portraitRows = tiles.flatMap((tile) => (tile.units || []).map((unit) => {
+      const key = unit.type ? `UNIT_PORTRAIT_${unit.type}` : "ICON_UNIT_STACK";
+      const image = images[key];
+      const badgeSize = Math.max(9, radius * 0.4);
+      const portraitScale = unit.type && image?.naturalWidth ? 1.4 : 1;
+      const assetPath = unit.type
+        ? `assets/unit-portraits/${unit.type}.png`
+        : `assets/civ5-icons/${key}.png`;
+      return {
+        tile: `${tile.x + 1}, ${tile.y + 1}`,
+        owner: unit.owner,
+        id: unit.id,
+        type: unit.type || "UNKNOWN",
+        asset: key,
+        assetPath,
+        loaded: Boolean(image?.complete && image.naturalWidth),
+        naturalSize: image?.naturalWidth ? `${image.naturalWidth}×${image.naturalHeight}` : "missing",
+        badgeSize: Number(badgeSize.toFixed(1)),
+        portraitDrawSize: Number((badgeSize * portraitScale).toFixed(1)),
+      };
+    }));
+    if (debugEnabled) {
+      console.groupCollapsed(`[Civ5] Unit icon assets · ${portraitRows.length} map references`);
+      console.table(portraitRows);
+      console.groupEnd();
+    }
+  });
   return images;
 }
 function locateReplayTile(px, py, width, height, radius, hexW) {
@@ -2409,7 +3062,8 @@ function locateReplayTile(px, py, width, height, radius, hexW) {
   }
   return -1;
 }
-function replayTerrainName(id) {
+function replayTerrainName(id, isLake = false) {
+  if (isLake) return "LAKE";
   return ["GRASSLAND", "PLAINS", "DESERT", "TUNDRA", "SNOW", "COAST", "OCEAN"][
     id
   ];
@@ -2425,12 +3079,32 @@ function replayRiverLabel(mask) {
   ].filter(Boolean);
   return edges.map((edge) => `River ${edge}`).join(", ");
 }
-function replayFeatureName(id) {
-  return { 0: "ICE", 1: "JUNGLE", 5: "FOREST" }[id];
+function replayRiverCrossingLabel(mask) {
+  if (!mask) return "";
+  const directions = ["north-east", "east", "south-east", "south-west", "west", "north-west"];
+  const crossings = directions.filter((_, direction) => mask & (1 << direction));
+  return crossings.length ? `River crossing toward ${crossings.join(", ")}` : "";
 }
-function replayTerrainLabel(id) {
+function replayArchaeologyLabel(data, playerName) {
+  if (!data?.length) return "";
+  const [artifactId, eraId, firstPlayer, secondPlayer, workId] = data;
+  const artifacts = ["", "ranged battle", "melee battle", "barbarian camp", "ancient ruins", "razed city", "written history"],
+    eras = ["Ancient", "Classical", "Medieval", "Renaissance", "Industrial", "Modern", "Atomic", "Information"];
+  const facts = [];
+  if (artifactId > 0) facts.push(artifacts[artifactId] ? `event: ${artifacts[artifactId]}` : "historical event");
+  if (eraId >= 0) facts.push(`${eras[eraId] || `era ${eraId}`} era`);
+  const participants = [firstPlayer, secondPlayer].filter((id) => id >= 0);
+  if (participants.length) facts.push(`involving ${[...new Set(participants.map(playerName))].join(" and ")}`);
+  if (workId >= 0) facts.push("associated with a great work");
+  return facts.length ? `Archaeological record: ${facts.join(", ")}` : "";
+}
+function replayFeatureName(id) {
+  return { 0: "ICE", 1: "JUNGLE", 4: "PLAINS", 5: "FOREST" }[id];
+}
+function replayTerrainLabel(id, isLake = false) {
+  if (isLake) return "Lake";
   return (
-    ["Grassland", "Plains", "Desert", "Tundra", "Snow", "Coast", "Ocean"][id] ||
+    ({0:"Grassland",1:"Plains",2:"Desert",3:"Tundra",4:"Snow",5:"Coast",6:"Ocean",18:"Sri Pada",19:"Mount Sinai"})[id] ||
     `Terrain ${id}`
   );
 }
@@ -2446,7 +3120,17 @@ function replayFeatureLabel(id) {
       3: "Oasis",
       4: "Flood plains",
       5: "Forest",
+      6: "Fallout",
+      7: "Barringer Crater",
+      8: "Mount Fuji",
+      9: "Mesa",
+      10: "Reef",
+      11: "Volcano",
+      12: "Gibraltar",
+      13: "Geyser",
+      14: "Fountain of Youth",
       15: "Cerro de Potosí",
+      16: "El Dorado",
       17: "Atoll",
       18: "Sri Pada",
       19: "Mount Sinai",
