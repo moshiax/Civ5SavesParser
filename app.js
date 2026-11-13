@@ -733,6 +733,7 @@ async function parseReplay(bytes, filename, {onProgress, onSection} = {}) {
     },
     mapWidth * mapHeight,
   );
+  markReplayLakes(tiles, mapWidth, mapHeight);
   const typeNames = [
     "MAJOR_EVENT",
     "CITY_FOUNDED",
@@ -791,6 +792,36 @@ async function parseReplay(bytes, filename, {onProgress, onSection} = {}) {
       metrics: metricData,
     },
   };
+}
+function markReplayLakes(tiles, width, height) {
+  const visited = new Uint8Array(tiles.length);
+  for (let start = 0; start < tiles.length; start++) {
+    if (visited[start] || tiles[start].plotTypeId !== 3) continue;
+    const component = [start];
+    visited[start] = 1;
+    for (let cursor = 0; cursor < component.length; cursor++) {
+      const index = component[cursor], x = index % width, y = Math.floor(index / width);
+      const visit = (nx, ny) => {
+        if (nx < 0 || nx >= width || ny < 0 || ny >= height) return;
+        const next = ny * width + nx;
+        if (!visited[next] && tiles[next].plotTypeId === 3) {
+          visited[next] = 1;
+          component.push(next);
+        }
+      };
+      visit(x - 1, y);
+      visit(x + 1, y);
+      if (y & 1) {
+        visit(x, y - 1); visit(x + 1, y - 1);
+        visit(x, y + 1); visit(x + 1, y + 1);
+      } else {
+        visit(x - 1, y - 1); visit(x, y - 1);
+        visit(x - 1, y + 1); visit(x, y + 1);
+      }
+    }
+    if (component.length <= 9)
+      for (const index of component) tiles[index].isLake = true;
+  }
 }
 async function sortReplayEvents(events, onProgress) {
   const compare = (a, b) => a.turn - b.turn;
