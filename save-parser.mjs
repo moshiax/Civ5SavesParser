@@ -127,9 +127,38 @@ async function parseSave(bytes, filename, {recoverMap = true, onProgress, onSect
   let z = -1,
     payload = null,
     lastError = "";
+  const inputView = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   for (const at of [...new Set(candidates)])
     try {
-      const result = await inflateSyncFlush(bytes.subarray(at + 2));
+      let result = null;
+      const format = at >= 8 ? inputView.getUint32(at - 8, true) : 0;
+      if (format === 1 || format === 2) {
+        // Civ V wraps the zlib stream in length-prefixed chunks. Remove each
+        // 32-bit chunk length before inflating; leaving them in the input
+        // creates a plausible but corrupted payload partway through the map.
+        const chunks = [];
+        let cursor = at - 4, compressedSize = 0, valid = true;
+        while (cursor < bytes.length) {
+          if (cursor + 4 > bytes.length) { valid = false; break; }
+          const chunkSize = inputView.getUint32(cursor, true);
+          cursor += 4;
+          if (chunkSize < 2 || chunkSize > 65536 || cursor + chunkSize > bytes.length) {
+            valid = false;
+            break;
+          }
+          chunks.push(bytes.subarray(cursor, cursor + chunkSize));
+          compressedSize += chunkSize;
+          cursor += chunkSize;
+        }
+        if (valid && cursor === bytes.length && chunks.length) {
+          const compressed = new Uint8Array(compressedSize);
+          let offset = 0;
+          for (const chunk of chunks) { compressed.set(chunk, offset); offset += chunk.length; }
+          if (compressed[0] === 120 && ((compressed[0] << 8) | compressed[1]) % 31 === 0)
+            result = await inflateSyncFlush(compressed.subarray(2));
+        }
+      }
+      if (!result) result = await inflateSyncFlush(bytes.subarray(at + 2));
       if (result.length > 1048576) {
         z = at;
         payload = result;
@@ -616,13 +645,15 @@ async function parseSerializedMap(payload, {recoverMap = true, onProgress, onSec
           const entryOffset = at;
           const hash = readU32();
           // BuildArrayHelpers::Read consumes only the zero hash for an empty
-          // slot. A nonzero, known build hash is followed by a short progress
-          // value; unknown nonzero hashes use a 32-bit compatibility value.
-          if (hash && saveBuildHashes.has(hash)) {
-            buildProgress.push({build: saveBuildHashes.get(hash), progress: read16()});
-          } else if (hash) {
-            skip(4);
-            trace("unknown build hash", {offset: entryOffset, hash: hash.toString(16).padStart(8, "0")});
+          // slot. Every nonzero hash is followed by a 16-bit progress value,
+          // whether or not this parser knows the build type.
+          if (hash) {
+            const progress = read16();
+            if (saveBuildHashes.has(hash)) {
+              buildProgress.push({build: saveBuildHashes.get(hash), progress});
+            } else {
+              trace("unknown build hash", {offset: entryOffset, hash: hash.toString(16).padStart(8, "0"), progress});
+            }
           }
         }
       }

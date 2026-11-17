@@ -125,21 +125,6 @@ body {
   overflow-wrap: anywhere;
   text-align: right;
 }
-.map-recovery-option {
-  display: flex;
-  align-items: flex-start;
-  gap: 9px;
-  margin-top: 12px;
-  color: var(--ink);
-  cursor: pointer;
-}
-.map-recovery-option input { margin: 4px 0 0; accent-color: var(--gold); }
-.map-recovery-option span { display: grid; gap: 1px; }
-.map-recovery-option b { font-size: 13px; font-weight: 600; }
-.map-recovery-option small { color: var(--muted); font-size: 12px; }
-.map-layer-controls .map-recovery-option { margin-top: 0; }
-.map-layer-controls .map-recovery-option input { margin: 0; }
-.map-layer-controls .map-recovery-option small { display: block; max-width: 240px; font-size: 10px; }
 .status {
   min-height: 0;
   padding-top: 6px;

@@ -86,9 +86,8 @@ let eventReturnScrollY = null;
 let replayMapNavigator = null;
 let redrawSaveMapInPlace = null;
 let dragDepth = 0;
-let showRecoveredMapTiles = false;
-function saveMapForDisplay(map, showRecovered) {
-  if (!map || showRecovered) return map;
+function saveMapForDisplay(map) {
+  if (!map) return map;
   const firstRecovered = map.tiles.findIndex((tile) => tile.recovered);
   if (firstRecovered < 0) return map;
   const cities = new Set();
@@ -1272,7 +1271,7 @@ function renderTab(tab, { navigate = false } = {}) {
       replaySectionsRendered.add(name);
       if (name === "map" && current.saveMap) {
         const turn = current.header.turn;
-        const displayMap = saveMapForDisplay(current.saveMap, showRecoveredMapTiles);
+        const displayMap = saveMapForDisplay(current.saveMap);
         renderReplayTab("map", { header: { startTurn: turn, endTurn: turn, players: current.header.players, turn, saveMode: true }, replay: {...displayMap, events: []} }, content);
         const integrityFindings = (current.saveMap.integrityFindings || current.saveMap.anomalies)
           .filter((item) => item.type !== "plot-record-decode-error");
@@ -1823,19 +1822,6 @@ function renderReplayTab(tab, d, box) {
       const routeLabel = document.createElement("label");
       routeLabel.innerHTML = '<input type="checkbox" data-map-layer="routes" checked>Roads and railroads';
       layerControls.append(routeLabel);
-      if (h.saveMode) {
-        const recoveryLabel = document.createElement("label");
-        recoveryLabel.className = "map-recovery-option";
-        recoveryLabel.innerHTML = `<input type="checkbox" data-map-recovery ${showRecoveredMapTiles ? "checked" : ""}><span>Recover damaged sections</span>`;
-        layerControls.append(recoveryLabel);
-        recoveryLabel.querySelector("input").addEventListener("change", (event) => {
-          showRecoveredMapTiles = event.currentTarget.checked;
-          const displayMap = saveMapForDisplay(current.saveMap, showRecoveredMapTiles);
-          if (redrawSaveMapInPlace?.(displayMap)) return;
-          replaySectionsOwner = null;
-          render(current);
-        });
-      }
     }
     for (const [name, { canvas, ctx }] of Object.entries(layers)) {
       const layerScale = name === "icons" ? Math.max(1, iconRenderScale) : renderScale;
