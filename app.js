@@ -391,6 +391,21 @@ function saveCityDisplayName(value) {
     return name.split("_").filter(Boolean).map((word) => word[0].toUpperCase() + word.slice(1).toLowerCase()).join(" ");
   return raw;
 }
+function saveCityReligionDetails(city, catalog = []) {
+  if (!city?.religionKnown) return ["Data unavailable"];
+  if (!city.religions?.length) return ["No followers recorded"];
+  return city.religions.map((religion) => {
+    const name = religion.religionId < 0
+      ? "No religion"
+      : religion.religionId === 0
+        ? "Pantheon"
+        : catalog.find((item) => item.id === religion.religionId)?.customName ||
+          window.CIV5_RELIGIONS?.[religion.religionId]?.name || `Religion ${religion.religionId}`;
+    return `${name}: ${religion.followers} followers, pressure ${religion.pressure}` +
+      `${religion.tradeRoutesApplyingPressure ? `, trade routes ${religion.tradeRoutesApplyingPressure}` : ""}` +
+      `${religion.holyCity ? ", holy city" : ""}`;
+  });
+}
 function yieldReplayTask() {
   if (typeof globalThis.scheduler?.yield === "function") return globalThis.scheduler.yield();
   if (typeof MessageChannel !== "undefined") return new Promise((resolve) => {
@@ -943,7 +958,7 @@ function findReplayTimeline(bytes, view, start, decoder) {
 function render(d) {
   redrawSaveMapInPlace = null;
   if (d.kind === "replay") return renderReplay(d);
-  setAvailableTabs(["summary", "map", "players", "metadata", "strings"]);
+  setAvailableTabs(["summary", "map", "players", "strings"]);
   const h = d.header,
     p = d.payload;
   $("#saveTitle").textContent =
@@ -987,7 +1002,6 @@ function renderReplay(d) {
     "events",
     "map",
     "players",
-    "metadata",
   ]);
   const h = d.header,
     r = d.replay;
@@ -1182,9 +1196,8 @@ function renderTab(tab, { navigate = false } = {}) {
         history: "Turn history",
         events: "Events",
         players: "Players",
-        metadata: "Metadata",
       };
-      const order = ["map", "events", "history", "players", "metadata"];
+      const order = ["map", "events", "history", "players"];
       for (const name of order) {
         const button = document.querySelector(`.tabs button[data-tab="${name}"]`);
         if (!button || button.hidden) continue;
@@ -1199,6 +1212,7 @@ function renderTab(tab, { navigate = false } = {}) {
         replaySections.set(name, section);
         replaySectionContents.set(name, content);
       }
+      observeSectionNavigation();
       const renderSection = (name) => {
         if (replaySectionsRendered.has(name)) return;
         const content = replaySectionContents.get(name);
@@ -1252,7 +1266,7 @@ function renderTab(tab, { navigate = false } = {}) {
     eventReturnScrollY = null;
     replayBuildGeneration++;
     sectionsBox.replaceChildren();
-    const titles = { summary: "Summary", map: "Map", players: "Players", metadata: "Metadata", strings: "Strings" };
+    const titles = { summary: "Summary", map: "Map", players: "Players", strings: "Strings" };
     for (const name of Object.keys(titles)) {
       const button = document.querySelector(`.tabs button[data-tab="${name}"]`);
       if (!button || button.hidden) continue;
@@ -1331,7 +1345,7 @@ function renderSaveTab(tab, d, box) {
       `File: ${d.file.name}`,
       `File size: ${d.file.size} bytes`,
       `Save version: ${saveVersionLabel(h.saveVersion)}`,
-      `Game build: ${h.gameVersion} (${h.build})`,
+      `Game build: ${h.gameVersion}`,
       `Game mode: ${gameModeLabel(h.mode)}`,
       `Turn: ${h.turn}`,
       `Civilization: ${gameEnumLabel(h.civ, "CIVILIZATION_")}`,
@@ -1339,6 +1353,9 @@ function renderSaveTab(tab, d, box) {
       `Era: ${gameEnumLabel(h.era, "ERA_")}`,
       `Game speed: ${gameEnumLabel(h.speed, "GAMESPEED_")}`,
       `World: ${h.worldSize} / ${h.mapScript}`,
+      `Starting era: ${gameEnumLabel(h.startingEra, "ERA_")}`,
+      `Map script: ${h.mapScript}`,
+      `Header sections: ${h.sectionCount}`,
       `Decompressed game data: ${humanBytes(p.bytes)}`,
       `Extracted tokens: ${p.tokens.length}`,
       `Readable strings: ${p.strings.length}`,
@@ -1465,6 +1482,14 @@ function renderReplayTab(tab, d, box) {
         `Players: ${h.players.length}`,
         `Replay events: ${r.events.length}`,
         `Metrics: ${r.metrics.length}`,
+      `Replay version: ${h.version}`,
+      `Build: ${h.build}`,
+      `Player color: ${h.playerColor || "—"}`,
+      `Starting era: ${gameEnumLabel(h.startingEra, "ERA_")}`,
+      `Ending era: ${gameEnumLabel(h.era, "ERA_")}`,
+      `Game speed: ${gameEnumLabel(h.speed, "GAMESPEED_")}`,
+      `World size: ${h.worldSize}`,
+      `Map script: ${h.mapScript}${h.mapScript2 && h.mapScript2 !== h.mapScript ? ` / ${h.mapScript2}` : ""}`,
         ...(h.dlc.some((x) => x.enabled)
           ? [
               `DLC: ${h.dlc
@@ -1731,11 +1756,12 @@ function renderReplayTab(tab, d, box) {
       if (localStorage.getItem(opacityKey) !== null && Number.isFinite(stored))
         initialTerritoryOpacity = Math.max(0, Math.min(100, stored));
     } catch {}
-    box.innerHTML = `<div class="map-timeline"><button id="mapPlayToggle" class="map-play-toggle" type="button" title="Play map history"><svg class="play-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg><svg class="pause-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2h4v12H3zm6 0h4v12H9z"/></svg></button><label class="metric-picker">Turn <input id="mapTurn" type="range" min="${h.startTurn}" max="${Math.max(h.startTurn, h.endTurn)}" value="${initialMapTurn}"><b id="mapTurnLabel">${initialMapTurn}</b></label><button id="mapExport" class="map-export-button" type="button">Render video</button><span id="mapExportStatus" role="status" aria-live="polite"></span></div><div class="replay-map-wrap"><div id="mapWorld" class="map-world" style="width:${canvasWidth}px;aspect-ratio:${canvasWidth}/${canvasHeight}"><canvas class="map-layer-canvas" data-map-layer="terrain" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="elevation" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="features" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="grid" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="territory" width="${canvasWidth}" height="${canvasHeight}"></canvas></div><div id="mapTileTooltip" class="map-tile-tooltip" hidden></div><div class="map-zoom-controls"><button type="button" data-zoom="out" aria-label="Zoom out">−</button><button type="button" data-zoom="reset">100%</button><button type="button" data-zoom="in" aria-label="Zoom in">+</button><button type="button" data-map-fullscreen aria-label="Open map in fullscreen" title="Fullscreen map">⛶</button></div></div><div class="map-layer-controls"><span>Layers</span>${[
+    box.innerHTML = `<div class="map-timeline"><button id="mapPlayToggle" class="map-play-toggle" type="button" title="Play map history"><svg class="play-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg><svg class="pause-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2h4v12H3zm6 0h4v12H9z"/></svg></button><label class="metric-picker">Turn <input id="mapTurn" type="range" min="${h.startTurn}" max="${Math.max(h.startTurn, h.endTurn)}" value="${initialMapTurn}"><b id="mapTurnLabel">${initialMapTurn}</b></label><button id="mapExport" class="map-export-button" type="button">${h.saveMode ? "Export map" : "Render video"}</button><span id="mapExportStatus" role="status" aria-live="polite"></span></div><div class="replay-map-wrap"><div id="mapWorld" class="map-world" style="width:${canvasWidth}px;aspect-ratio:${canvasWidth}/${canvasHeight}"><canvas class="map-layer-canvas" data-map-layer="terrain" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="elevation" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="features" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="grid" width="${canvasWidth}" height="${canvasHeight}"></canvas><canvas class="map-layer-canvas" data-map-layer="territory" width="${canvasWidth}" height="${canvasHeight}"></canvas></div><div id="mapTileTooltip" class="map-tile-tooltip" hidden></div><div class="map-zoom-controls"><button type="button" data-zoom="out" aria-label="Zoom out">−</button><button type="button" data-zoom="reset">100%</button><button type="button" data-zoom="in" aria-label="Zoom in">+</button><button type="button" data-map-fullscreen aria-label="Open map in fullscreen" title="Fullscreen map">⛶</button></div></div><div class="map-layer-controls"><span>Layers</span>${[
       ["terrain", "Terrain"],
       ["elevation", "Elevation"],
       ["features", "Features"],
       ["territory", "Territory"],
+      ...(h.saveMode ? [["cities", "Cities"]] : []),
       ...(h.saveMode ? [["icons", "Icons"]] : []),
       ["grid", "Grid"],
     ]
@@ -1758,8 +1784,13 @@ function renderReplayTab(tab, d, box) {
     const hasMapHistory = !h.saveMode && h.startTurn < h.endTurn && r.events.length > 0;
     if (!hasMapHistory) {
       const timeline = box.querySelector(".map-timeline");
-      timeline.hidden = true;
-      timeline.style.display = "none";
+      if (h.saveMode) {
+        timeline.querySelector("#mapPlayToggle").hidden = true;
+        timeline.querySelector(".metric-picker").hidden = true;
+      } else {
+        timeline.hidden = true;
+        timeline.style.display = "none";
+      }
     }
     let tileClickStart = null;
     const world = box.querySelector("#mapWorld"),
@@ -1782,8 +1813,6 @@ function renderReplayTab(tab, d, box) {
     const cityCanvas = document.createElement("canvas");
     cityCanvas.className = "map-layer-canvas";
     cityCanvas.dataset.mapLayer = "cities";
-    // City icons in saves must sit above the territory fill; the unit/icon
-    // canvas is appended later and therefore remains above cities.
     world.insertBefore(cityCanvas, layers.territory.canvas.nextSibling);
     layers.cities = { canvas: cityCanvas, ctx: cityCanvas.getContext("2d") };
     const mapPixelCount = canvasWidth * canvasHeight;
@@ -1814,6 +1843,7 @@ function renderReplayTab(tab, d, box) {
     iconCanvas.dataset.mapLayer = "icons";
     world.append(iconCanvas);
     layers.icons = { canvas: iconCanvas, ctx: iconCanvas.getContext("2d") };
+    world.append(cityCanvas);
     const layerControls = box.querySelector(".map-layer-controls");
     if (layerControls) {
       const riverLabel = document.createElement("label");
@@ -1823,8 +1853,31 @@ function renderReplayTab(tab, d, box) {
       routeLabel.innerHTML = '<input type="checkbox" data-map-layer="routes" checked>Roads and railroads';
       layerControls.append(routeLabel);
     }
+    let visibilitySelect = null;
+    if (h.saveMode && layerControls) {
+      const visibilityCanvas = document.createElement("canvas");
+      visibilityCanvas.className = "map-layer-canvas";
+      visibilityCanvas.dataset.mapLayer = "visibility";
+      world.append(visibilityCanvas);
+      layers.visibility = {canvas: visibilityCanvas, ctx: visibilityCanvas.getContext("2d")};
+      const teamLabel = document.createElement("label");
+      teamLabel.textContent = "Visibility: ";
+      visibilitySelect = document.createElement("select");
+      const visibilityTeams = [...new Set(mapPlayers.map((p) => p.teamId).filter(Number.isInteger))];
+      if (!visibilityTeams.includes(63) && r.tiles.some((tile) => tile.visibilityCount?.length > 63 || tile.revealedFlags?.length > 1))
+        visibilityTeams.push(63);
+      visibilitySelect.innerHTML = '<option value="observer">Observer</option>' + visibilityTeams.map((teamId) => {
+        if (teamId === 63) return '<option value="63">Barbarians</option>';
+        const member = mapPlayers.find((p) => p.teamId === teamId);
+        return `<option value="${teamId}">${esc(civilizationDisplayName(member, member?.slot))}</option>`;
+      }).join("");
+      teamLabel.append(visibilitySelect);
+      layerControls.append(teamLabel);
+    }
     for (const [name, { canvas, ctx }] of Object.entries(layers)) {
-      const layerScale = name === "icons" ? Math.max(1, iconRenderScale) : renderScale;
+      const layerScale = name === "icons" || name === "cities"
+        ? Math.max(1, iconRenderScale)
+        : renderScale;
       canvas.width = Math.max(1, Math.round(canvasWidth * layerScale));
       canvas.height = Math.max(1, Math.round(canvasHeight * layerScale));
       ctx.scale(layerScale, layerScale);
@@ -2245,9 +2298,13 @@ function renderReplayTab(tab, d, box) {
         if (tile.featureHash && !dominantFeature && !replayFeaturesRenderedSeparately.includes(featureName)) drawBadge(featureIcon, cx - radius * 0.48, cy - radius * 0.42, Math.max(9, radius * 0.4), "F", "#315d3c");
         if (tile.underConstructionHash && !tile.improvementHash && tile.buildProgress?.some(({progress}) => progress > 0)) drawBadge(tileIcons[`IMPROVEMENT_${saveImprovementName(tile.underConstructionHash)}`], cx + radius * 0.48, cy - radius * 0.03, Math.max(9, radius * 0.38), "…", "#8b5e20");
         if (tile.units?.length) {
-          const unit = tile.units[0], portraitIcon = unit.type && tileIcons[`UNIT_PORTRAIT_${unit.type}`];
-          drawBadge(portraitIcon || tileIcons.ICON_UNIT_STACK, cx + radius * 0.48, cy - radius * 0.42,
-            Math.max(9, radius * 0.4), tile.units.length > 9 ? "U" : String(tile.units.length), "#3a4f73", "none", portraitIcon ? 1.4 : 1);
+          const unit = tile.units[0], portraitIcon = unit.type && tileIcons[`UNIT_PORTRAIT_${unit.type}`],
+            unitOwner = playerForMapOwner(unit.owner),
+            unitStroke = unitOwner?.civilization === "CIVILIZATION_MINOR" || (unitOwner?.civilization || "").startsWith("MINOR_CIV_")
+              ? unitOwner.secondaryColor || unitOwner.color
+              : unitOwner?.color || "#3a4f73";
+          drawBadge(portraitIcon, cx + radius * 0.48, cy - radius * 0.42,
+            Math.max(9, radius * 0.4), tile.units.length > 9 ? "U" : String(tile.units.length), unitStroke, "none", portraitIcon ? 1.4 : 1);
         }
         if (tile.dataUnavailable) {
           const grid = drawLayers.grid.ctx;
@@ -2319,6 +2376,101 @@ function renderReplayTab(tab, d, box) {
             cityCtx.drawImage(cityIcons.CITY_FIRING, cx - fireSize / 2, cy - fireSize / 2, fireSize, fireSize);
             cityCtx.restore();
           }
+          if (city.name) {
+            const majority = city.religionKnown
+              ? city.religions?.find((religion) => religion.religionId === city.majorityReligionId)
+              : null,
+              religionImage = majority && city.majorityReligionId > 0
+                ? cityIcons[`RELIGION_${city.majorityReligionId}`]
+                : null,
+              capitalImage = city.isCapital && !isMinor ? cityIcons.CAPITAL : null,
+              connectedImage = city.connectedToCapitalThisTurn ? cityIcons.TRADE_ROUTE : null,
+              religionSize = religionImage?.complete && religionImage.naturalWidth ? Math.max(9, Math.min(17, radius * 0.42)) : 0,
+              capitalSize = capitalImage?.complete && capitalImage.naturalWidth ? Math.max(9, Math.min(15, radius * 0.38)) : 0,
+              connectedSize = connectedImage?.complete && connectedImage.naturalWidth ? Math.max(8, Math.min(12, radius * 0.3)) : 0,
+              population = String(city.population || 1),
+              cityName = saveCityDisplayName(city.name);
+            cityCtx.save();
+            let fontSize = Math.max(8, Math.min(12, radius * 0.27)),
+              pad = 0,
+              gap = 0,
+              popWidth = 0,
+              measuredNameWidth = 0,
+              maxBannerWidth = 0,
+              bannerWidth = 0;
+            const measureBanner = () => {
+              cityCtx.font = `600 ${fontSize}px system-ui, sans-serif`;
+              pad = Math.max(3, fontSize * 0.36);
+              gap = Math.max(2, fontSize * 0.28);
+              popWidth = cityCtx.measureText(population).width;
+              measuredNameWidth = cityCtx.measureText(cityName).width;
+              maxBannerWidth = Math.max(hexW * 2.5, fontSize * 8);
+              const fixedWidth = pad * 2 + capitalSize + (capitalSize ? gap : 0) + popWidth + gap +
+                (religionSize ? gap + religionSize : 0);
+              return maxBannerWidth - fixedWidth;
+            };
+            let availableNameWidth = measureBanner();
+            while (measuredNameWidth > availableNameWidth && fontSize > 6) {
+              fontSize = Math.max(6, fontSize - 0.5);
+              availableNameWidth = measureBanner();
+            }
+            bannerWidth = pad * 2 + capitalSize + (capitalSize ? gap : 0) + popWidth + gap + measuredNameWidth +
+              (religionSize ? gap + religionSize : 0);
+            const bannerHeight = fontSize + pad * 1.1,
+              left = cx - bannerWidth / 2,
+              top = cy - radius * 1.08,
+              color = player?.secondaryColor || player?.color || "#405b78";
+            cityCtx.beginPath();
+            cityCtx.roundRect(left, top, bannerWidth, bannerHeight, Math.max(2, fontSize * 0.22));
+            cityCtx.fillStyle = color;
+            cityCtx.globalAlpha = 0.76;
+            cityCtx.fill();
+            cityCtx.globalAlpha = 1;
+            cityCtx.strokeStyle = "rgba(238, 224, 187, .9)";
+            cityCtx.lineWidth = Math.max(0.8, radius * 0.025);
+            cityCtx.stroke();
+            cityCtx.textBaseline = "middle";
+            cityCtx.textAlign = "left";
+            let cursorX = left + pad;
+            const centerY = top + bannerHeight / 2;
+            if (capitalSize) {
+              cityCtx.drawImage(capitalImage, cursorX, centerY - capitalSize / 2, capitalSize, capitalSize);
+              cursorX += capitalSize + gap;
+            }
+            cityCtx.fillStyle = "#fff";
+            cityCtx.font = `700 ${fontSize}px system-ui, sans-serif`;
+            cityCtx.lineJoin = "round";
+            cityCtx.lineWidth = Math.max(1, fontSize * 0.12);
+            cityCtx.strokeStyle = "rgba(10, 16, 24, .95)";
+            cityCtx.strokeText(population, cursorX, centerY);
+            cityCtx.fillText(population, cursorX, centerY);
+            cursorX += popWidth + gap;
+            cityCtx.textAlign = "left";
+            cityCtx.strokeText(cityName, cursorX, centerY);
+            cityCtx.fillText(cityName, cursorX, centerY);
+            if (religionSize) {
+              cityCtx.drawImage(religionImage, left + bannerWidth - pad - religionSize, centerY - religionSize / 2, religionSize, religionSize);
+            }
+            if (connectedSize) {
+              cityCtx.drawImage(connectedImage, cx - connectedSize / 2, top - connectedSize * 1.05, connectedSize, connectedSize);
+            }
+            cityCtx.restore();
+          }
+          if (isMinor && player?.allianceKnown && Number.isInteger(player.ally)) {
+            const allyPlayer = mapPlayers.find((candidate) => candidate.slot === player.ally),
+              civIcon = allyPlayer && cityIcons[`CIVICON_${allyPlayer.civilization}`],
+              badgeSize = Math.max(8, Math.min(13, radius * 0.31)),
+              badgeY = Math.max(badgeSize / 2 + 1, cy - radius * 1.08 - badgeSize * 0.72);
+            if (civIcon?.complete && civIcon.naturalWidth) {
+              cityCtx.save();
+              cityCtx.beginPath(); cityCtx.arc(cx, badgeY, badgeSize * 0.64, 0, Math.PI * 2);
+              cityCtx.fillStyle = "rgba(22, 27, 34, .88)"; cityCtx.fill();
+              cityCtx.strokeStyle = "rgba(238, 224, 187, .95)"; cityCtx.lineWidth = 0.8;
+              cityCtx.stroke();
+              cityCtx.drawImage(civIcon, cx - badgeSize / 2, badgeY - badgeSize / 2, badgeSize, badgeSize);
+              cityCtx.restore();
+            }
+          }
         }
       }
       if (generation <= committedStaticDrawGeneration || !box.contains(world)) return;
@@ -2336,11 +2488,37 @@ function renderReplayTab(tab, d, box) {
     };
     const terrainImages = loadReplayTerrainImages();
     const cityIcons = loadReplayCityIcons();
+    const civilizationIcons = loadReplayCivilizationIcons(mapPlayers), cityIconsReady = cityIcons.ready;
+    cityIcons.ready = Promise.all([cityIconsReady, civilizationIcons.ready]).then(() => {
+      for (const [key, image] of Object.entries(civilizationIcons))
+        if (key !== "ready") cityIcons[key] = image;
+    });
     const tileIcons = h.saveMode ? loadReplayTileIcons(r.tiles, radius) : {};
     drawStaticLayers();
     Promise.all([terrainImages.ready, cityIcons.ready, tileIcons.ready]).then(() => {
       if (box.contains(world)) drawStaticLayers();
     });
+    const drawVisibility = () => {
+      const ctx = layers.visibility?.ctx;
+      if (!ctx) return;
+      ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+      const teamId = visibilitySelect?.value ?? "observer";
+      if (teamId === "observer") return;
+      const selectedTeam = Number(teamId);
+      if (!Number.isInteger(selectedTeam)) return;
+      r.tiles.forEach((tile, index) => {
+        const word = tile.revealedFlags?.[selectedTeam >>> 5] || 0,
+          revealed = Boolean((word >>> (selectedTeam & 31)) & 1);
+        if ((tile.visibilityCount?.[selectedTeam] || 0) > 0) return;
+        const x = index % r.mapWidth, y = Math.floor(index / r.mapWidth),
+          cx = radius + hexW * (x + 0.5 * (y & 1)), cy = canvasY(y);
+        traceReplayHex(ctx, cx, cy, radius);
+        ctx.fillStyle = revealed ? "rgba(9, 13, 20, .30)" : "rgba(5, 8, 13, .76)";
+        ctx.fill();
+      });
+    };
+    visibilitySelect?.addEventListener("change", drawVisibility);
+    drawVisibility();
     viewport.addEventListener("dragstart", (event) => event.preventDefault());
     const drawTerritory = (state) => {
       const ctx = layers.territory.ctx;
@@ -2550,6 +2728,27 @@ function renderReplayTab(tab, d, box) {
             : h.saveMode && tile.plotCity?.owner >= 0 && tile.plotCity?.id >= 0
               ? `${playerName(tile.plotCity.owner)} · #${tile.plotCity.id}`
               : "",
+          ...(h.saveMode && tile.city
+            ? [
+                `Highest population: ${tile.city.highestPopulation ?? "unknown"}`,
+                `Founded turn: ${tile.city.founded}`,
+                `Acquired turn: ${tile.city.acquired}`,
+                tile.city.isCapital ? "Capital city" : "",
+                tile.city.connectedToCapitalThisTurn ? "Connected to capital" : "",
+              ]
+            : []),
+          ...(h.saveMode && tile.city && (playerForMapOwner(tile.city.owner)?.civilization === "CIVILIZATION_MINOR" || (playerForMapOwner(tile.city.owner)?.civilization || "").startsWith("MINOR_CIV_"))
+            ? [playerForMapOwner(tile.city.owner)?.allianceKnown
+                ? playerForMapOwner(tile.city.owner)?.ally == null
+                  ? "City-state has no ally"
+                  : `Allied with: ${civilizationDisplayName(playerForMapOwner(playerForMapOwner(tile.city.owner).ally), playerForMapOwner(tile.city.owner).ally)}`
+                : "City-state alliance unknown"]
+            : []),
+          ...(h.saveMode && tile.city?.religionKnown
+            ? [
+                ...saveCityReligionDetails(tile.city, r.religions),
+              ]
+            : []),
           tile.culture ? `Culture stored here: ${tile.culture}` : "",
           tile.ownershipDuration ? `Owned for ${tile.ownershipDuration} turns` : "",
           tile.improvementDuration ? `Improvement built ${tile.improvementDuration} turns ago` : "",
@@ -2614,13 +2813,29 @@ function renderReplayTab(tab, d, box) {
             : h.saveMode && tile.plotCity?.owner >= 0
               ? [["City", `${civilizationDisplayName(playerForMapOwner(tile.plotCity.owner), tile.plotCity.owner)} · #${tile.plotCity.id}`]]
               : []),
+          ...(tile.city
+            ? [
+                ["Population", tile.city.population],
+                ["Founded", tile.city.founded],
+                ["Acquired", tile.city.acquired],
+                ["Capital", tile.city.isCapital],
+                ...saveCityReligionDetails(tile.city, r.religions).map((entry) => ["", entry]),
+              ]
+            : []),
+          ...(h.saveMode && tile.city && (playerForMapOwner(tile.city.owner)?.civilization === "CIVILIZATION_MINOR" || (playerForMapOwner(tile.city.owner)?.civilization || "").startsWith("MINOR_CIV_"))
+            ? [["Ally", playerForMapOwner(tile.city.owner)?.allianceKnown
+                ? playerForMapOwner(tile.city.owner)?.ally == null
+                  ? "None"
+                  : civilizationDisplayName(playerForMapOwner(playerForMapOwner(tile.city.owner).ally), playerForMapOwner(tile.city.owner).ally)
+                : "Unknown"]]
+            : []),
           ...(!h.saveMode && city?.eventText ? [["Event", city.eventText]] : []),
           ["Yields", tile.yields?.map((value, i) => value ? `${replayYieldNames[i]} ${value}` : "").filter(Boolean).join(" · ") || "—"],
           ...Object.entries(tile).filter(([key]) => !["x", "y", "typeId", "plotTypeId", "landmassId", "isLake", "featureId", "featureHash", "featureName", "resourceHash", "resourceAmount", "improvementHash", "improvementName", "improvementPillaged", "routeId", "routePillaged", "owner", "plotCity", "city", "yields", "units", "dataUnavailable"].includes(key)).map(([key, value]) => [label(key), format(value)]),
           ...(tile.dataUnavailable ? [["Decode status", "Tile fields were not decoded; map placeholder shown"]] : []),
         ];
       tileDialog.querySelector("#tileDetailsTitle").textContent = `Tile ${x + 1}, ${y + 1}`;
-      tileDetails.innerHTML = `<dl>${fields.map(([key, value]) => `<div><dt>${esc(key)}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl>`;
+      tileDetails.innerHTML = `<dl>${fields.map(([key, value]) => `<div>${key ? `<dt>${esc(key)}</dt>` : ""}<dd>${esc(value)}</dd></div>`).join("")}</dl>`;
       tooltip.hidden = true;
       if (!tileDialog.open) tileDialog.showModal();
     });
@@ -2665,7 +2880,7 @@ function renderReplayTab(tab, d, box) {
     const exportDialog = document.createElement("dialog");
     const exportSourceCanvas = Object.values(layers)[0].canvas;
     exportDialog.className = "animated-dialog map-export-dialog";
-    exportDialog.innerHTML = `<form class="map-export-form"><div class="map-export-heading"><h3>Video export settings</h3><button class="map-export-close" type="button">×</button></div><label>Duration per turn <span><input name="frameDuration" type="range" min="50" max="1000" step="50" value="250"><b data-value="frameDuration">250 ms</b></span></label><label>Bitrate <span><input name="bitrate" type="range" min="500000" max="12000000" step="250000" value="2500000"><b data-value="bitrate">2.5 Mbps</b></span></label><label>Maximum width <select name="maxWidth"><option value="0">Original</option><option value="2560">2560 px</option><option value="1920">1920 px</option><option value="1280">1280 px</option></select></label><label>Codec <select name="codec"><option value="auto">Automatic (VP9 preferred)</option><option value="vp9">VP9</option><option value="vp8">VP8</option></select></label><div class="map-export-estimate"><span>Frame rate</span><b data-estimate="fps">4 fps</b><span>Output resolution</span><b data-estimate="resolution">—</b><span>Video duration</span><b data-estimate="duration">—</b></div><div class="map-export-actions"><button type="button" data-action="cancel">Cancel</button><button type="submit">Render &amp; download</button></div></form>`;
+    exportDialog.innerHTML = `<form class="map-export-form"><div class="map-export-heading"><h3>${h.saveMode ? "Map export settings" : "Video export settings"}</h3><button class="map-export-close" type="button">×</button></div>${h.saveMode ? "" : `<label>Duration per turn <span><input name="frameDuration" type="range" min="50" max="1000" step="50" value="250"><b data-value="frameDuration">250 ms</b></span></label><label>Bitrate <span><input name="bitrate" type="range" min="500000" max="12000000" step="250000" value="2500000"><b data-value="bitrate">2.5 Mbps</b></span></label>`}<label>Maximum width <select name="maxWidth"><option value="0">Original</option><option value="2560">2560 px</option><option value="1920">1920 px</option><option value="1280">1280 px</option></select></label>${h.saveMode ? `<p>Exports the visible map layers as a PNG image.</p>` : `<label>Codec <select name="codec"><option value="auto">Automatic (VP9 preferred)</option><option value="vp9">VP9</option><option value="vp8">VP8</option></select></label><div class="map-export-estimate"><span>Frame rate</span><b data-estimate="fps">4 fps</b><span>Output resolution</span><b data-estimate="resolution">—</b><span>Video duration</span><b data-estimate="duration">—</b></div>`}<div class="map-export-actions"><button type="button" data-action="cancel">Cancel</button><button type="submit">${h.saveMode ? "Export PNG" : "Render &amp; download"}</button></div></form>`;
     box.append(exportDialog);
     const exportForm = exportDialog.querySelector("form"),
       frameDurationInput = exportForm.elements.frameDuration,
@@ -2704,15 +2919,17 @@ function renderReplayTab(tab, d, box) {
         exportDialog.querySelector('[data-estimate="resolution"]').textContent = `${width} × ${height}`;
         exportDialog.querySelector('[data-estimate="duration"]').textContent = `${minutes}:${String(seconds).padStart(2, "0")}`;
       };
-    frameDurationInput.addEventListener("input", updateExportEstimate);
-    bitrateInput.addEventListener("input", updateExportEstimate);
-    maxWidthInput.addEventListener("change", updateExportEstimate);
+    frameDurationInput?.addEventListener("input", updateExportEstimate);
+    bitrateInput?.addEventListener("input", updateExportEstimate);
+    maxWidthInput.addEventListener("change", () => {
+      if (!h.saveMode) updateExportEstimate();
+    });
     exportButton.addEventListener("click", () => {
-      if (location.protocol === "file:") {
+      if (!h.saveMode && location.protocol === "file:") {
         showNotification("Video export is unavailable when this page is opened directly from disk. Open it through a local HTTP server and try again.");
         return;
       }
-      updateExportEstimate();
+      if (!h.saveMode) updateExportEstimate();
       exportDialog.showModal();
     });
     const closeExportDialog = () => exportDialog.close();
@@ -2838,6 +3055,34 @@ function renderReplayTab(tab, d, box) {
     };
     exportForm.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (h.saveMode) {
+        const maxWidth = Number(maxWidthInput.value),
+          { width, height } = exportDimensions(maxWidth),
+          output = document.createElement("canvas"),
+          background = document.createElement("canvas"),
+          context = output.getContext("2d"),
+          backgroundContext = background.getContext("2d"),
+          visibleLayers = [...world.querySelectorAll(".map-layer-canvas")].filter((canvas) => !canvas.hidden);
+        output.width = width;
+        output.height = height;
+        background.width = width;
+        background.height = height;
+        composeExportBackground(background, backgroundContext, visibleLayers);
+        composeExportFrame(output, context, background, layers.territory.canvas);
+        output.toBlob((blob) => {
+          if (!blob) { exportStatus.textContent = "Could not create the PNG image."; return; }
+          const url = URL.createObjectURL(blob), link = document.createElement("a");
+          link.href = url;
+          const sourceName = current?.file?.name || "Civ5-map";
+          link.download = `${sourceName.replace(/\.(?:Civ5Save|Civ5Replay)$/i, "")}-map.png`;
+          document.body.append(link);
+          link.click();
+          link.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        }, "image/png");
+        exportDialog.close();
+        return;
+      }
       const settings = {
         frameDuration: Number(frameDurationInput.value),
         bitrate: Number(bitrateInput.value),
@@ -3000,12 +3245,30 @@ function loadReplayTerrainImages() {
   return loadReplayImages(names, (name) => `assets/terrain/${name}.png`);
 }
 function loadReplayCityIcons() {
-  const names = ["CIV_CITY_ICON", "CIV_CS_ICON", "CITY_FIRING", "Cultured", "Maritime", "Mercantile", "Militaristic", "Religious"];
+  const religionEntries = Object.entries(window.CIV5_RELIGIONS || {}).filter(([id, religion]) => Number(id) > 0 && religion.name),
+    names = ["CIV_CITY_ICON", "CIV_CS_ICON", "CITY_FIRING", "CAPITAL", "TRADE_ROUTE", "Cultured", "Maritime", "Mercantile", "Militaristic", "Religious", ...religionEntries.map(([id]) => `RELIGION_${id}`)];
   return loadReplayImages(
     names,
-    (name) => `assets/civ5-icons/${name}.png`,
+    (name) => {
+      if (!name.startsWith("RELIGION_")) return `assets/civ5-icons/${name}.png`;
+      const religion = window.CIV5_RELIGIONS[name.slice("RELIGION_".length)];
+      return `assets/religion-icons/${religion.name.replaceAll(" ", "_")}.png`;
+    },
     (name) => name === "CIV_CS_ICON" ? name : name.toUpperCase(),
   );
+}
+function loadReplayCivilizationIcons(players) {
+  const slugFor = (civilization) => {
+    const raw = (civilization || "").replace(/^CIVILIZATION_/, "").toLowerCase();
+    const aliases = {the_maya: "maya", the_huns: "huns", the_ottomans: "ottoman", mongolia: "mongol"};
+    return aliases[raw] || raw;
+  };
+  const entries = [...new Map(players
+    .filter((player) => player.civilization && player.civilization !== "CIVILIZATION_MINOR")
+    .map((player) => [player.civilization, slugFor(player.civilization)])).entries()];
+  return loadReplayImages(entries.map(([civilization]) => civilization),
+    (civilization) => `assets/civ-icons/${slugFor(civilization)}.png`,
+    (civilization) => `CIVICON_${civilization}`);
 }
 function loadReplayTileIcons(tiles, radius) {
   const names = new Set();
@@ -3019,7 +3282,6 @@ function loadReplayTileIcons(tiles, radius) {
     const feature = saveFeatureName(tile.featureHash);
     if (tile.featureHash && feature && !["ICE", "JUNGLE", "FOREST", "FLOOD_PLAINS"].includes(feature)) names.add(`FEATURE_${feature}`);
     if (tile.units?.length) {
-      names.add("ICON_UNIT_STACK");
       for (const unit of tile.units) if (unit.type) names.add(`UNIT_PORTRAIT_${unit.type}`);
     }
   }
@@ -3028,13 +3290,13 @@ function loadReplayTileIcons(tiles, radius) {
     : `assets/civ5-icons/${name}.png`);
   images.ready = images.ready.then(() => {
     const portraitRows = tiles.flatMap((tile) => (tile.units || []).map((unit) => {
-      const key = unit.type ? `UNIT_PORTRAIT_${unit.type}` : "ICON_UNIT_STACK";
+      const key = unit.type ? `UNIT_PORTRAIT_${unit.type}` : null;
       const image = images[key];
       const badgeSize = Math.max(9, radius * 0.4);
       const portraitScale = unit.type && image?.naturalWidth ? 1.4 : 1;
       const assetPath = unit.type
         ? `assets/unit-portraits/${unit.type}.png`
-        : `assets/civ5-icons/${key}.png`;
+        : null;
       return {
         tile: `${tile.x + 1}, ${tile.y + 1}`,
         owner: unit.owner,

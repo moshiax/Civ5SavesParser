@@ -1,0 +1,16 @@
+window.CIV5_RELIGIONS = Object.freeze({
+  0: {name: "Pantheon"},
+  1: {name: "Buddhism"},
+  2: {name: "Catholicism"},
+  3: {name: "Confucianism"},
+  4: {name: "Hinduism"},
+  5: {name: "Islam"},
+  6: {name: "Judaism"},
+  7: {name: "Shinto"},
+  8: {name: "Sikhism"},
+  9: {name: "Taoism"},
+  10: {name: "Tengriism"},
+  11: {name: "Zoroastrianism"},
+  12: {name: "Eastern Orthodoxy"},
+  13: {name: "Protestantism"},
+});

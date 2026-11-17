@@ -52,6 +52,18 @@
   --sans: Inter, "Segoe UI", sans-serif;
   --mono: Consolas, monospace;
 }
+select:not([multiple]) {
+  appearance: none;
+  padding: 8px 34px 8px 11px;
+  border: 1px solid #cdbb96;
+  border-radius: 5px;
+  background: #fffdf8 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='m1 1 5 5 5-5' fill='none' stroke='%2371684f' stroke-width='1.6'/%3E%3C/svg%3E") no-repeat right 11px center;
+  color: #49391f;
+  font: 500 13px var(--sans);
+  cursor: pointer;
+}
+select:not([multiple]):hover { border-color: #a88b56; background-color: #fffaf0; }
+select:not([multiple]):focus-visible { outline: 2px solid #a87c3580; outline-offset: 2px; border-color: var(--gold); }
 * {
   box-sizing: border-box;
   scrollbar-color: var(--scroll-thumb) var(--scroll-track);
@@ -954,6 +966,22 @@ input[type="range"]:disabled { cursor: progress; opacity: .55; }
 .map-layer-controls label:hover {
   color: #49391f;
 }
+.map-layer-controls select {
+  appearance: none;
+  min-width: 150px;
+  max-width: 100%;
+  padding: 8px 34px 8px 11px;
+  border: 1px solid #cdbb96;
+  border-radius: 5px;
+  background: #fffdf8 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='m1 1 5 5 5-5' fill='none' stroke='%2371684f' stroke-width='1.6'/%3E%3C/svg%3E") no-repeat right 11px center;
+  box-shadow: 0 1px 2px #493c2010;
+  color: #49391f;
+  font: 500 13px var(--sans);
+  cursor: pointer;
+  transition: border-color .15s, box-shadow .15s, background-color .15s;
+}
+.map-layer-controls select:hover { border-color: #a88b56; background-color: #fffaf0; }
+.map-layer-controls select:focus-visible { outline: 2px solid #a87c3580; outline-offset: 2px; border-color: var(--gold); box-shadow: 0 0 0 3px #a87c3520; }
 .map-layer-controls input {
   appearance: none;
   position: relative;
@@ -1170,6 +1198,7 @@ input[type="range"]:disabled { cursor: progress; opacity: .55; }
 :root[data-theme="dark"] .data-table td { border-color: var(--line); }
 :root[data-theme="dark"] .data-table th { background: var(--dark-raised); }
 :root[data-theme="dark"] .metric-picker select { border-color: #65583c; background-color: var(--dark-inset); background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='m1 1 5 5 5-5' fill='none' stroke='%23c1a15f' stroke-width='1.6'/%3E%3C/svg%3E"); color: var(--ink); }
+:root[data-theme="dark"] select:not([multiple]) { border-color: #65583c; background-color: var(--dark-inset); background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='m1 1 5 5 5-5' fill='none' stroke='%23c1a15f' stroke-width='1.6'/%3E%3C/svg%3E"); color: var(--ink); }
 :root[data-theme="dark"] .metric-picker select:hover { border-color: var(--gold); background-color: var(--dark-hover); }
 :root[data-theme="dark"] .lobby-option { border-color: var(--line); background: var(--dark-raised); color: #d9c48e; }
 :root[data-theme="dark"] .civ-mark-image { background: color-mix(in srgb, var(--civ-color, #777) 25%, var(--surface)); }
@@ -1182,6 +1211,8 @@ input[type="range"]:disabled { cursor: progress; opacity: .55; }
 :root[data-theme="dark"] .map-zoom-controls button { border-color: var(--line); background: var(--dark-raised); color: var(--ink); }
 :root[data-theme="dark"] .map-zoom-controls button:hover { background: #403a2d; }
 :root[data-theme="dark"] .map-layer-controls { color: var(--dark-soft-text); }
+:root[data-theme="dark"] .map-layer-controls select { border-color: #65583c; background-color: var(--dark-inset); background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='m1 1 5 5 5-5' fill='none' stroke='%23c1a15f' stroke-width='1.6'/%3E%3C/svg%3E"); color: var(--ink); }
+:root[data-theme="dark"] .map-layer-controls select:hover { border-color: var(--gold); background-color: var(--dark-hover); }
 :root[data-theme="dark"] .map-layer-controls label:hover { color: var(--ink); }
 :root[data-theme="dark"] .map-layer-controls input { border-color: var(--dark-frame); background: linear-gradient(var(--dark-raised), var(--dark-inset)); box-shadow: inset 0 1px 2px #0005; }
 :root[data-theme="dark"] .map-layer-controls input:checked { border-color: #88642d; background: linear-gradient(#b99453, #967035); }

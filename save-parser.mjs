@@ -1,4 +1,5 @@
 import {CIV5_UNIT_TYPES} from "./assets/civ5-unit-types.js";
+import {extractCityReligions, extractReligionCatalog} from "./city-religion.mjs";
 
 function yieldToBrowser() {
   if (typeof globalThis.scheduler?.yield === "function") return globalThis.scheduler.yield();
@@ -241,6 +242,17 @@ async function parseSave(bytes, filename, {recoverMap = true, onProgress, onSect
     saveMap.entities.units = saveMap.units.length;
     reportProgress(onProgress, "Matching cities", 76);
     const cities = await extractSerializedCities(payload, saveMap.mapWidth, saveMap.mapHeight, turn, players);
+    const playerState = extractCurrentPlayerState(payload, saveMap.plotEndOffset, saveMap.tiles, cities, players, turn);
+    saveMap.capitalsKnown = playerState.capitalsKnown;
+    for (const city of cities) city.isCapital = playerState.capitalIds.get(`${city.owner}:${city.id}`) ?? null;
+    for (const player of players) if (player.civilization === "CIVILIZATION_MINOR" || player.civilization.startsWith("MINOR_CIV_")) {
+      const alliance = playerState.alliances.get(player.slot);
+      player.ally = alliance?.ally ?? null;
+      player.allianceKnown = Boolean(alliance?.known);
+      player.allianceSinceTurn = alliance?.sinceTurn ?? null;
+    }
+    saveMap.cityReligion = extractCityReligions(payload, cities);
+    saveMap.religions = extractReligionCatalog(payload, saveMap.plotOffset, cities, players);
     saveMap.cities = cities;
     saveMap.entities.cities = cities.length;
     const byId = new Map(cities.map((city) => [`${city.owner}:${city.id}`, city]));
@@ -441,9 +453,10 @@ async function extractSerializedCities(payload, mapWidth, mapHeight, turn, playe
         name = decoder.decode(nameBytes);
       if (!name.trim() || /[\0-\x08\x0b\x0c\x0e-\x1f]/.test(name)) continue;
       at += nameLength;
+      const nameEndOffset = at;
       const scriptLength = int32(at); at += 4;
       if (scriptLength < -1 || scriptLength > payload.length - at) continue;
-      const city = {owner, id, x, y, name, population: scalars.population, founded: scalars.founded, razingTurns};
+      const city = {owner, id, x, y, name, population: scalars.population, highestPopulation: scalars.highestPopulation, founded: scalars.founded, acquired: scalars.acquired, razingTurns, evidence: {offset: start, nameEndOffset}};
       const key = `${owner}:${id}`;
       if (!cities.has(key)) cities.set(key, city);
     } catch { /* most byte patterns are not city records */ }
@@ -805,7 +818,88 @@ async function parseSerializedMap(payload, {recoverMap = true, onProgress, onSec
     entry.tiles++; entry.quantity += tile.resourceAmount; inventory.set(tile.resourceHash, entry);
   }
   const resourceInventory = [...inventory.values()].map((entry) => ({...entry, declaredTiles: mapResourceTotals[0].get(entry.hash) ?? null, declaredLandTiles: mapResourceTotals[1].get(entry.hash) ?? null})).sort((a,b) => a.name.localeCompare(b.name));
-  return {mapWidth, mapHeight, tiles, parsedTiles: tiles.filter((tile) => !tile.dataUnavailable).length, complete, recoveryEnabled: recoverMap, decodeIssue, resourceSetting, resourceInventory, resourceTotals: mapResourceTotals.map((entries) => [...entries].map(([hash, count]) => ({hash, count, resource: saveResourceName(hash)}))), anomalies, integrityFindings, entities: {units: tiles.reduce((n, tile) => n + tile.units.length, 0), cities: new Set(tiles.filter((tile) => tile.plotCity?.owner >= 0 && tile.plotCity?.id >= 0).map((tile) => `${tile.plotCity.owner}:${tile.plotCity.id}`)).size}};
+  return {mapWidth, mapHeight, plotOffset: mapAt, plotEndOffset: at, tiles, parsedTiles: tiles.filter((tile) => !tile.dataUnavailable).length, complete, recoveryEnabled: recoverMap, decodeIssue, resourceSetting, resourceInventory, resourceTotals: mapResourceTotals.map((entries) => [...entries].map(([hash, count]) => ({hash, count, resource: saveResourceName(hash)}))), anomalies, integrityFindings, entities: {units: tiles.reduce((n, tile) => n + tile.units.length, 0), cities: new Set(tiles.filter((tile) => tile.plotCity?.owner >= 0 && tile.plotCity?.id >= 0).map((tile) => `${tile.plotCity.owner}:${tile.plotCity.id}`)).size}};
+}
+
+function extractCurrentPlayerState(payload, mapEnd, tiles, cities, players, turn) {
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength), anchors = [];
+  const readU = (p) => p >= 0 && p + 4 <= payload.length ? view.getUint32(p, true) : -1;
+  const readI = (p) => p >= 0 && p + 4 <= payload.length ? view.getInt32(p, true) : -1;
+  for (let pos = mapEnd; pos + 4 <= payload.length; pos++) {
+    if (readU(pos) !== 6 || pos < 32) continue;
+    const identity = pos - 32, owner = readI(identity + 24), founded = readI(identity + 11), conqueror = readI(identity + 18);
+    if (owner < 0 || owner >= 64 || founded < 0 || founded > 10000 || conqueror < -1 || conqueror >= 64) continue;
+    const validBools = (start, count) => { for (let n = 0; n < count; n++) if (payload[start + n] > 1) return false; return true; };
+    if (!validBools(identity, 11) || !validBools(identity + 15, 3) || !validBools(identity + 22, 2)) continue;
+    let at = pos, valid = true;
+    for (let n = 0; n < 10; n++) {
+      if (readU(at) !== 6 || at + 28 > payload.length) { valid = false; break; }
+      at += 28;
+    }
+    if (valid) anchors.push({id: owner, offset: identity, endOffset: at});
+    pos += valid ? at - pos - 1 : 0;
+  }
+  const capitalIds = new Map(), alliances = new Map();
+  if (anchors.length !== 64 || anchors.some((anchor, i) => anchor.id !== i)) return {capitalIds, capitalsKnown: false, alliances, anchorCount: anchors.length};
+  const ownedCities = new Map();
+  for (const city of cities) { const arr = ownedCities.get(city.owner) || []; arr.push(city); ownedCities.set(city.owner, arr); }
+  const active = new Set(players.map((player) => player.slot));
+  const capitalOwners = new Set();
+  for (const player of players) {
+    const identity = anchors[player.slot].offset, prefix = identity - 840;
+    if (prefix < mapEnd || readU(prefix) !== 16) continue;
+    const population = readI(prefix + 12), land = readI(prefix + 16), owned = ownedCities.get(player.slot) || [];
+    const actualPopulation = owned.reduce((sum, city) => sum + (city.population || 0), 0);
+    const actualLand = tiles.filter((tile) => tile.owner === player.slot && tile.plotTypeId !== 3).length;
+    if (population !== actualPopulation || land !== actualLand) continue;
+    // BNW stores capital ID at identity 240
+    const reference = identity - 240, localId = readI(reference);
+    if (reference < mapEnd || localId < -1 || !owned.length) continue;
+    const matches = owned.filter((city) => city.id === localId);
+    if (matches.length !== 1) continue;
+    capitalOwners.add(player.slot);
+    for (const city of owned) capitalIds.set(`${city.owner}:${city.id}`, city.id === localId);
+  }
+  for (const player of players) if (player.civilization === "CIVILIZATION_MINOR" || player.civilization.startsWith("MINOR_CIV_")) {
+    const lo = anchors[player.slot].endOffset,
+      nextPlayer = anchors[player.slot + 1]?.offset ?? payload.length,
+      firstCity = cities.filter((city) => city.owner === player.slot).reduce((min, city) => Math.min(min, city.evidence.offset), nextPlayer),
+      hi = Math.min(nextPlayer, firstCity);
+    // BNW saves, minor ai object starts at 92-95kb
+    const candidateStart = Math.max(lo, lo + 90_000),
+      candidateEnd = Math.min(hi, lo + 100_000);
+    const scanMinorAI = (start, end) => {
+      const matches = [];
+      for (let at = start; at + 36 < end; at++) if (readU(at) === 1) {
+        const ally = readI(at + 24), since = readI(at + 28);
+        if (ally < -1 || ally > 21 || since < -1 || since > turn || (ally >= 0 && !active.has(ally))) continue;
+        const parsed = validateMinorAI(payload, at, hi, turn);
+        if (parsed) matches.push({ally: ally < 0 ? null : ally, sinceTurn: ally < 0 ? null : since, known: true});
+      }
+      return matches;
+    };
+    let found = scanMinorAI(candidateStart, Math.min(candidateEnd, hi));
+    if (found.length !== 1) found = scanMinorAI(lo, hi);
+    if (found.length === 1) alliances.set(player.slot, found[0]);
+  }
+  const expectedCapitalOwners = players.filter((player) => !["CIVILIZATION_MINOR", "CIVILIZATION_BARBARIAN"].includes(player.civilization) && !player.civilization.startsWith("MINOR_CIV_") && (ownedCities.get(player.slot)?.length || 0) > 0);
+  return {capitalIds, capitalsKnown: expectedCapitalOwners.every((player) => capitalOwners.has(player.slot)), alliances, anchorCount: anchors.length};
+}
+
+function validateMinorAI(bytes, start, limit, turn) {
+  const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength); let p = start;
+  const i = () => { if (p + 4 > limit) throw 0; const n = v.getInt32(p, true); p += 4; return n; };
+  const u = () => { if (p + 4 > limit) throw 0; const n = v.getUint32(p, true); p += 4; return n; };
+  const skip = (n) => { if (p + n > limit) throw 0; p += n; };
+  const bools = (n) => { for (let j=0;j<n;j++) { if (p >= limit || bytes[p] > 1) throw 0; p++; } };
+  try {
+    if (u() !== 1) return false; const personality=i(), status=i(); skip(4);
+    const threatened=i(), countdown=i(), ally=i(), since=i(), bought=i();
+    if (personality < -1 || personality > 3 || status < -1 || status > 2 || threatened < -1 || threatened > 100000 || countdown < -1 || countdown > 100000 || ally < -1 || ally > 21 || since < -1 || since > turn || bought < -1 || bought > 21 || (ally >= 0 && since < 0)) return false;
+    bools(22); for(let j=0;j<484;j++){const x=i();if(x < -1||x>10000)return false;} bools(22); skip(12*22*4); bools(4*22+2*80);
+    for(let j=0;j<22;j++){const count=u();if(count>128)return false;for(let k=0;k<count;k++){const ver=u(), quest=i(), qturn=i();skip(8);if((ver!==1&&ver!==2)||quest<0||quest>30||qturn < -1||qturn>turn)return false;if(ver===2)bools(1);}}
+    bools(1); return u()===1;
+  } catch { return false; }
 }
 const crc32Table = new Uint32Array(256);
 for (let n = 0; n < crc32Table.length; n++) {
